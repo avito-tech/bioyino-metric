@@ -4,6 +4,10 @@ version = "0.1.0"
 authors = ["Sergey Noskov aka Albibek <albibek@gmail.com>"]
 description = "Library for handling metrics in bioyino and related projects"
 edition = "2018"
+license = "MIT"
+repository = "https://github.com/Albibek/bioyino-metric"
+keywords = ["statsd", "bioyino", "metric", "metrics"]
+categories = ["parser-implementations", "network-programming"]
 
 [dependencies]
 serde="^1.0"
