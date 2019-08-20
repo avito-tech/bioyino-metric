@@ -21,4 +21,3 @@ num-traits="^0.2"
 
 [build-dependencies]
 capnpc = "^0.10"
-
