@@ -6,11 +6,11 @@ use capnp;
 use capnp::message::{Allocator, Builder, HeapAllocator};
 use failure::Error;
 use failure_derive::Fail;
-use serde_derive::{Serialize, Deserialize};
+use serde_derive::{Deserialize, Serialize};
 
-use crate::protocol_capnp::{metric as cmetric, metric_type, gauge};
+use crate::protocol_capnp::{gauge, metric as cmetric, metric_type};
 
-use num_traits::{Float, AsPrimitive};
+use num_traits::{AsPrimitive, Float};
 
 #[derive(Fail, Debug)]
 pub enum MetricError {
@@ -34,7 +34,7 @@ pub enum MetricError {
 // vector must be sorted
 pub fn percentile<F>(vec: &Vec<F>, nth: F) -> F
 where
-F: Float + AsPrimitive<usize>,
+    F: Float + AsPrimitive<usize>,
 {
     let last = F::from(vec.len() - 1).unwrap(); // usize to float should be ok for both f32 and f64
     if last == F::zero() {
@@ -61,7 +61,7 @@ F: Float + AsPrimitive<usize>,
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetricType<F>
 where
-F: Copy + PartialEq + Debug,
+    F: Copy + PartialEq + Debug,
 {
     Counter,
     DiffCounter(F),
@@ -74,7 +74,7 @@ F: Copy + PartialEq + Debug,
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Metric<F>
 where
-F: Copy + PartialEq + Debug,
+    F: Copy + PartialEq + Debug,
 {
     pub value: F,
     pub mtype: MetricType<F>,
@@ -83,20 +83,17 @@ F: Copy + PartialEq + Debug,
     pub sampling: Option<f32>,
 }
 
-pub trait FromF64
-{
+pub trait FromF64 {
     fn from_f64(value: f64) -> Self;
 }
 
-impl FromF64 for f64
-{
+impl FromF64 for f64 {
     fn from_f64(value: f64) -> Self {
         value
     }
 }
 
-impl FromF64 for f32
-{
+impl FromF64 for f32 {
     // TODO specilaization will give us a possibility to use any other float the same way
     fn from_f64(value: f64) -> Self {
         let (mantissa, exponent, sign) = Float::integer_decode(value);
@@ -109,14 +106,14 @@ impl FromF64 for f32
 
 impl<F> Metric<F>
 where
-F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
+    F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
 {
     pub fn new(
         value: F,
         mtype: MetricType<F>,
         timestamp: Option<u64>,
         sampling: Option<f32>,
-        ) -> Result<Self, MetricError> {
+    ) -> Result<Self, MetricError> {
         let mut metric = Metric {
             value,
             mtype,
@@ -180,10 +177,7 @@ F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
         Ok(())
     }
 
-
-    pub fn from_capnp<'a>(
-        reader: cmetric::Reader<'a>,
-        ) -> Result<(Bytes, Metric<F>), MetricError> {
+    pub fn from_capnp<'a>(reader: cmetric::Reader<'a>) -> Result<(Bytes, Metric<F>), MetricError> {
         let name = reader.get_name().map_err(MetricError::Capnp)?.into();
         let value: F = F::from_f64(reader.get_value());
 
@@ -229,7 +223,7 @@ F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
                     None
                 },
                 Some(reader.get_update_counter()),
-                ),
+            ),
             Err(_) => (None, None),
         };
 
@@ -271,7 +265,7 @@ F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
                             let value: f64 = (*value).as_();
                             timer_builder.set(idx as u32, value);
                         })
-                    .last();
+                        .last();
                 }
                 MetricType::Set(ref v) => {
                     let mut set_builder = t_builder.init_set(v.len() as u32);
@@ -280,7 +274,7 @@ F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
                         .map(|(idx, value)| {
                             set_builder.set(idx as u32, *value);
                         })
-                    .last();
+                        .last();
                 }
             }
         }
@@ -323,7 +317,7 @@ F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
 
 impl<F> IntoIterator for Metric<F>
 where
-F: Float + Debug + FromF64 + AsPrimitive<usize>
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
     type Item = (&'static str, F);
     type IntoIter = MetricIter<F>;
@@ -334,7 +328,7 @@ F: Float + Debug + FromF64 + AsPrimitive<usize>
 
 pub struct MetricIter<F>
 where
-F: Float + Debug + FromF64 + AsPrimitive<usize>
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
     m: Metric<F>,
     count: usize,
@@ -344,7 +338,7 @@ F: Float + Debug + FromF64 + AsPrimitive<usize>
 
 impl<F> MetricIter<F>
 where
-F: Float + Debug + FromF64 + AsPrimitive<usize>
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
     fn new(mut metric: Metric<F>) -> Self {
         let sum = if let MetricType::Timer(ref mut agg) = metric.mtype {
@@ -364,7 +358,7 @@ F: Float + Debug + FromF64 + AsPrimitive<usize>
 
 impl<F> Iterator for MetricIter<F>
 where
-F: Float + Debug + FromF64 + AsPrimitive<usize>
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
     type Item = (&'static str, F);
 
@@ -375,25 +369,25 @@ F: Float + Debug + FromF64 + AsPrimitive<usize>
             &MetricType::Gauge(_) if self.count == 0 => Some(("", self.m.value.into())),
             &MetricType::Timer(ref agg) => {
                 match self.count {
-                    0 => Some((".count", F::from_f64(agg.len() as f64) )),
+                    0 => Some(("count", F::from_f64(agg.len() as f64))),
                     // agg.len() = 0 is impossible here because of metric creation logic.
                     // For additional panic safety and to ensure unwrapping is safe here
                     // this will return None interrupting the iteration and making other
                     // aggregations unreachable since they are useless in that case
                     1 => agg.last().map(|last| (".last", (*last).into())),
-                    2 => Some((".min", agg[0])),
-                    3 => Some((".max", agg[agg.len() - 1])),
-                    4 => Some((".sum", self.timer_sum.unwrap())),
-                    5 => Some((".median", percentile(agg, F::from_f64(0.5)))),
+                    2 => Some(("min", agg[0])),
+                    3 => Some(("max", agg[agg.len() - 1])),
+                    4 => Some(("sum", self.timer_sum.unwrap())),
+                    5 => Some(("median", percentile(agg, F::from_f64(0.5)))),
                     6 => {
                         let len: F = F::from_f64(agg.len() as f64);
-                        Some((".mean", self.timer_sum.unwrap() / len))
+                        Some(("mean", self.timer_sum.unwrap() / len))
                     }
-                    7 => Some((".percentile.75", percentile(agg, F::from_f64(0.75)))),
-                    8 => Some((".percentile.95", percentile(agg, F::from_f64(0.95)))),
-                    9 => Some((".percentile.98", percentile(agg, F::from_f64(0.98)))),
-                    10 => Some((".percentile.99", percentile(agg, F::from_f64(0.99)))),
-                    11 => Some((".percentile.999", percentile(agg, F::from_f64(0.999)))),
+                    7 => Some(("percentile.75", percentile(agg, F::from_f64(0.75)))),
+                    8 => Some(("percentile.95", percentile(agg, F::from_f64(0.95)))),
+                    9 => Some(("percentile.98", percentile(agg, F::from_f64(0.98)))),
+                    10 => Some(("percentile.99", percentile(agg, F::from_f64(0.99)))),
+                    11 => Some(("percentile.999", percentile(agg, F::from_f64(0.999)))),
                     _ => None,
                 }
             }

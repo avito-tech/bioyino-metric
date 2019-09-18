@@ -172,7 +172,7 @@ where
     ))
 }
 
-type MetricParsingError<'a> = easy::Errors<u8, &'a [u8], PointerOffset>;
+pub type MetricParsingError<'a> = easy::Errors<u8, &'a [u8], PointerOffset>;
 
 #[allow(unused_variables)]
 pub trait ParseErrorHandler {
