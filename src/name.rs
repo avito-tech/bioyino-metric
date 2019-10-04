@@ -2,17 +2,20 @@ use std::hash::{Hash, Hasher};
 
 use bytes::BytesMut;
 
-// TODO: think error type. There is single possible error atm, so sort_tags returns () instead
-// TODO: think if we need sorted tags in btreemap instead of string
-// TODO: handle repeating same tags i.e. gorets;a=b;e=b;a=b:...
+// TODO: Think error type. There is single possible error atm, so sort_tags returns () instead
+// TODO: Think if we need sorted tags in btreemap instead of string
+// TODO: Handle repeating same tags i.e. gorets;a=b;e=b;a=b:...
+// TODO: Split MetricName type to two: RawMetricName and MetricName, where the former is readonly
+// and guarantees the tag position was already searched for, so we can remove those "expects tag position is
+// found" everywhere
 
-pub enum TagMode {
+pub enum TagFormat {
     Graphite,
 }
 
 /// Contains buffer containing the full metric name including tags
 /// and some data to split tags from name useful for appending aggregates
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct MetricName {
     pub name: BytesMut,
     pub tag_pos: Option<usize>,
@@ -21,10 +24,7 @@ pub struct MetricName {
 
 impl MetricName {
     pub fn new(name: BytesMut, tag_pos: Option<usize>) -> Self {
-        Self {
-            name,
-            tag_pos, /*tags: BTreeMap::new()*/
-        }
+        Self { name, tag_pos /*tags: BTreeMap::new()*/ }
     }
 
     /// find position where tags start, forcing re-search when it's already found
@@ -36,7 +36,7 @@ impl MetricName {
     }
 
     /// returns only name, without tags, considers tag position was already found before
-    pub fn without_tags(&self) -> &[u8] {
+    pub fn name_without_tags(&self) -> &[u8] {
         if let Some(pos) = self.tag_pos {
             &self.name[..pos]
         } else {
@@ -44,14 +44,35 @@ impl MetricName {
         }
     }
 
+    /// returns slice with full name, including tags
+    pub fn name_with_tags(&self) -> &[u8] {
+        &self.name[..]
+    }
+
+    /// returns slice with only tags, includes leading semicolon, expects tag position was already
+    /// found
+    pub fn tags_without_name(&self) -> &[u8] {
+        if let Some(pos) = self.tag_pos {
+            &self.name[pos..]
+        } else {
+            &[]
+        }
+    }
+
+    /// returns length of tags field, including leading semicolon
+    /// considers tag position was already found before
+    pub fn tags_len(&self) -> usize {
+        if let Some(pos) = self.tag_pos {
+            self.name.len() - pos
+        } else {
+            0
+        }
+    }
+
     /// sort tags in place using intermediate buffer, buffer length MUST be at least
     /// `name.len() - tag_pos` bytes
     /// sorting is made lexicographically
-    pub fn sort_tags<B: AsMut<[u8]>>(
-        &mut self,
-        mode: TagMode,
-        intermediate: &mut B,
-    ) -> Result<(), ()> {
+    pub fn sort_tags<B: AsMut<[u8]>>(&mut self, mode: TagFormat, intermediate: &mut B) -> Result<(), ()> {
         if self.tag_pos.is_none() {
             if !self.find_tag_pos(true) {
                 return Err(());
@@ -64,7 +85,7 @@ impl MetricName {
         }
         use lazysort::Sorted;
         match mode {
-            TagMode::Graphite => {
+            TagFormat::Graphite => {
                 let mut offset = 0;
                 for part in self.name.split(|c| *c == b';').skip(1).sorted() {
                     let end = offset + part.len();
@@ -83,14 +104,14 @@ impl MetricName {
     }
 
     //  allocate tags structure and shorten name fetching tags into BTreeMap
-    //pub fn fetch_tags<B: BufMut>(&mut self, mode: TagMode) {
+    //pub fn fetch_tags<B: BufMut>(&mut self, mode: TagFormat) {
     //let tag_pos = match self.tag_pos {
     //None => return,
     //Some(t) => t,
     //};
 
     //match mode {
-    //TagMode::Graphite => unimplemented!(),
+    //TagFormat::Graphite => unimplemented!(),
     //}
     //}
 }
@@ -119,22 +140,32 @@ mod tests {
     }
 
     #[test]
-    fn metric_name_no_tags() {
+    fn metric_name_tags_len() {
+        let mut name = MetricName::new(BytesMut::from(&b"gorets.bobez;a=b;c=d"[..]), None);
+        name.find_tag_pos(true);
+        assert_eq!(name.tags_len(), 8);
+
+        let mut name = MetricName::new(BytesMut::from(&b"gorets.bobezzz"[..]), None);
+        name.find_tag_pos(true);
+        assert_eq!(name.tags_len(), 0);
+    }
+
+    #[test]
+    fn metric_name_splits() {
         let mut name = MetricName::new(BytesMut::from(&b"gorets.bobez"[..]), None);
         name.find_tag_pos(true);
-        assert_eq!(name.without_tags(), &b"gorets.bobez"[..]);
+        assert_eq!(name.name_without_tags(), &b"gorets.bobez"[..]);
+        assert_eq!(name.tags_without_name().len(), 0);
 
         let mut name = MetricName::new(BytesMut::from(&b"gorets.bobez;a=b;c=d"[..]), None);
         name.find_tag_pos(true);
-        assert_eq!(name.without_tags(), &b"gorets.bobez"[..]);
+        assert_eq!(name.name_without_tags(), &b"gorets.bobez"[..]);
+        assert_eq!(name.tags_without_name(), &b";a=b;c=d"[..]);
     }
 
     #[test]
     fn metric_name_sort_tags_graphite() {
-        let mut name = MetricName::new(
-            BytesMut::from(&b"gorets.bobez;t=y;a=b;c=e;u=v;c=d;c=b;aaa=z"[..]),
-            None,
-        );
+        let mut name = MetricName::new(BytesMut::from(&b"gorets.bobez;t=y;a=b;c=e;u=v;c=d;c=b;aaa=z"[..]), None);
         name.find_tag_pos(false);
         let tag_pos = name.tag_pos.unwrap();
 
@@ -144,15 +175,10 @@ mod tests {
         //let mut intermediate = Vec::with_capacity(tag_len);
         let mut intermediate = BytesMut::new();
         intermediate.resize(tag_len - 1, 0u8); // intentionally resize to less bytes than required
-        assert!(name
-            .sort_tags(TagMode::Graphite, &mut intermediate)
-            .is_err());
+        assert!(name.sort_tags(TagFormat::Graphite, &mut intermediate).is_err());
 
         intermediate.put(0u8);
-        assert!(name.sort_tags(TagMode::Graphite, &mut intermediate).is_ok());
-        assert_eq!(
-            &name.name[..],
-            &b"gorets.bobez;a=b;aaa=z;c=b;c=d;c=e;t=y;u=v"[..]
-        );
+        assert!(name.sort_tags(TagFormat::Graphite, &mut intermediate).is_ok());
+        assert_eq!(&name.name[..], &b"gorets.bobez;a=b;aaa=z;c=b;c=d;c=e;t=y;u=v"[..]);
     }
 }

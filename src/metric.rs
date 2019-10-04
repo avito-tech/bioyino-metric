@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 
-use bytes::Bytes;
 use capnp;
 use capnp::message::{Allocator, Builder, HeapAllocator};
 use failure::Error;
 use failure_derive::Fail;
 use serde_derive::{Deserialize, Serialize};
 
+use crate::name::MetricName;
 use crate::protocol_capnp::{gauge, metric as cmetric, metric_type};
 
 use num_traits::{AsPrimitive, Float};
@@ -108,19 +108,8 @@ impl<F> Metric<F>
 where
     F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
 {
-    pub fn new(
-        value: F,
-        mtype: MetricType<F>,
-        timestamp: Option<u64>,
-        sampling: Option<f32>,
-    ) -> Result<Self, MetricError> {
-        let mut metric = Metric {
-            value,
-            mtype,
-            timestamp,
-            sampling,
-            update_counter: 1,
-        };
+    pub fn new(value: F, mtype: MetricType<F>, timestamp: Option<u64>, sampling: Option<f32>) -> Result<Self, MetricError> {
+        let mut metric = Metric { value, mtype, timestamp, sampling, update_counter: 1 };
 
         if let MetricType::Timer(ref mut agg) = metric.mtype {
             agg.push(metric.value)
@@ -142,11 +131,7 @@ where
                 // FIXME: this is most probably incorrect when joining with another
                 // non-fresh metric count2 != 1
                 let prev = *previous;
-                let diff = if new.value > prev {
-                    new.value - prev
-                } else {
-                    new.value
-                };
+                let diff = if new.value > prev { new.value - prev } else { new.value };
                 *previous = new.value;
                 self.value = self.value + diff;
             }
@@ -177,8 +162,10 @@ where
         Ok(())
     }
 
-    pub fn from_capnp<'a>(reader: cmetric::Reader<'a>) -> Result<(Bytes, Metric<F>), MetricError> {
+    pub fn from_capnp<'a>(reader: cmetric::Reader<'a>) -> Result<(MetricName, Metric<F>), MetricError> {
         let name = reader.get_name().map_err(MetricError::Capnp)?.into();
+        let mut name = MetricName::new(name, None);
+        name.find_tag_pos(true);
         let value: F = F::from_f64(reader.get_value());
 
         let mtype = reader.get_type().map_err(MetricError::Capnp)?;
@@ -206,36 +193,16 @@ where
             }
         };
 
-        let timestamp = if reader.has_timestamp() {
-            Some(reader.get_timestamp().map_err(MetricError::Capnp)?.get_ts())
-        } else {
-            None
-        };
+        let timestamp = if reader.has_timestamp() { Some(reader.get_timestamp().map_err(MetricError::Capnp)?.get_ts()) } else { None };
 
         let (sampling, up_counter) = match reader.get_meta() {
-            Ok(reader) => (
-                if reader.has_sampling() {
-                    reader
-                        .get_sampling()
-                        .ok()
-                        .map(|reader| reader.get_sampling())
-                } else {
-                    None
-                },
-                Some(reader.get_update_counter()),
-            ),
+            Ok(reader) => (if reader.has_sampling() { reader.get_sampling().ok().map(|reader| reader.get_sampling()) } else { None }, Some(reader.get_update_counter())),
             Err(_) => (None, None),
         };
 
         // we should NOT use Metric::new here because it is not a newly created metric
         // we'd get duplicate value in timer/set metrics if we used new
-        let metric: Metric<F> = Metric {
-            value: value,
-            mtype,
-            timestamp,
-            sampling,
-            update_counter: if let Some(c) = up_counter { c } else { 1 },
-        };
+        let metric: Metric<F> = Metric { value: value, mtype, timestamp, sampling, update_counter: if let Some(c) = up_counter { c } else { 1 } };
 
         Ok((name, metric))
     }
@@ -348,11 +315,7 @@ where
         } else {
             None
         };
-        MetricIter {
-            m: metric,
-            count: 0,
-            timer_sum: sum,
-        }
+        MetricIter { m: metric, count: 0, timer_sum: sum }
     }
 }
 
@@ -374,7 +337,7 @@ where
                     // For additional panic safety and to ensure unwrapping is safe here
                     // this will return None interrupting the iteration and making other
                     // aggregations unreachable since they are useless in that case
-                    1 => agg.last().map(|last| (".last", (*last).into())),
+                    1 => agg.last().map(|last| ("last", (*last).into())),
                     2 => Some(("min", agg[0])),
                     3 => Some(("max", agg[agg.len() - 1])),
                     4 => Some(("sum", self.timer_sum.unwrap())),
@@ -426,8 +389,7 @@ mod tests {
 
     #[test]
     fn test_metric_capnp_diffcounter() {
-        let mut metric1 =
-            Metric::new(1f64, MetricType::DiffCounter(0.1f64), Some(20), Some(0.2)).unwrap();
+        let mut metric1 = Metric::new(1f64, MetricType::DiffCounter(0.1f64), Some(20), Some(0.2)).unwrap();
         let metric2 = Metric::new(1f64, MetricType::DiffCounter(0.5f64), None, None).unwrap();
         metric1.aggregate(metric2).unwrap();
         capnp_test(metric1);
@@ -435,15 +397,10 @@ mod tests {
 
     #[test]
     fn test_metric_capnp_timer() {
-        let mut metric1 =
-            Metric::new(1f64, MetricType::Timer(Vec::new()), Some(10), Some(0.1)).unwrap();
+        let mut metric1 = Metric::new(1f64, MetricType::Timer(Vec::new()), Some(10), Some(0.1)).unwrap();
         let metric2 = Metric::new(2f64, MetricType::Timer(vec![3f64]), None, None).unwrap();
         metric1.aggregate(metric2).unwrap();
-        assert!(if let MetricType::Timer(ref v) = metric1.mtype {
-            v.len() == 3
-        } else {
-            false
-        });
+        assert!(if let MetricType::Timer(ref v) = metric1.mtype { v.len() == 3 } else { false });
 
         capnp_test(metric1);
     }
