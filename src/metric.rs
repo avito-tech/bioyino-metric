@@ -7,6 +7,7 @@ use failure::Error;
 use failure_derive::Fail;
 use serde_derive::{Deserialize, Serialize};
 
+use crate::aggregate::{percentile, Aggregate};
 use crate::name::MetricName;
 use crate::protocol_capnp::{gauge, metric as cmetric, metric_type};
 
@@ -28,34 +29,6 @@ pub enum MetricError {
 
     #[fail(display = "schema error: {}", _0)]
     CapnpSchema(capnp::NotInSchema),
-}
-
-// Percentile counter. Not safe. Requires at least two elements in vector
-// vector must be sorted
-pub fn percentile<F>(vec: &Vec<F>, nth: F) -> F
-where
-    F: Float + AsPrimitive<usize>,
-{
-    let last = F::from(vec.len() - 1).unwrap(); // usize to float should be ok for both f32 and f64
-    if last == F::zero() {
-        return vec[0].clone();
-    }
-
-    let k = nth * last;
-    let f = k.floor();
-    let c = k.ceil();
-
-    if c == f {
-        // exact nth percentile have been found
-        return vec[k.as_()].clone();
-    }
-
-    let m0 = c - k;
-    let m1 = k - f;
-    let d0 = vec[f.as_()].clone() * m0;
-    let d1 = vec[c.as_()].clone() * m1;
-    let res = d0 + d1;
-    res
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,9 +70,9 @@ impl FromF64 for f32 {
     // TODO specilaization will give us a possibility to use any other float the same way
     fn from_f64(value: f64) -> Self {
         let (mantissa, exponent, sign) = Float::integer_decode(value);
-        let sign_f = sign as f32;
+        let sign_f = f32::from(sign);
         let mantissa_f = mantissa as f32;
-        let exponent_f = 2f32.powf(exponent as f32);
+        let exponent_f = 2f32.powf(f32::from(exponent));
         sign_f * mantissa_f * exponent_f
     }
 }
@@ -120,7 +93,8 @@ where
         Ok(metric)
     }
 
-    pub fn aggregate(&mut self, new: Metric<F>) -> Result<(), Error> {
+    /// Join self with a new incoming metric depending on type
+    pub fn accumulate(&mut self, new: Metric<F>) -> Result<(), Error> {
         use self::MetricType::*;
         self.update_counter += new.update_counter;
         match (&mut self.mtype, new.mtype) {
@@ -162,7 +136,19 @@ where
         Ok(())
     }
 
-    pub fn from_capnp<'a>(reader: cmetric::Reader<'a>) -> Result<(MetricName, Metric<F>), MetricError> {
+    /// aggregates matric with apecified aggregate
+    pub fn aggregate(&self, agg: &Aggregate<F>, cached_sum: &mut Option<F>) -> Option<F>
+    where
+        F: Float + Debug + AsPrimitive<f64> + AsPrimitive<usize> + FromF64 + Sync,
+    {
+        match self.mtype {
+            MetricType::Timer(ref values) => agg.calculate(values, cached_sum, f64::from(self.update_counter)),
+            _ if agg == &Aggregate::UpdateCount => agg.calculate(&Vec::new(), cached_sum, f64::from(self.update_counter)),
+            _ => None,
+        }
+    }
+
+    pub fn from_capnp(reader: cmetric::Reader) -> Result<(MetricName, Metric<F>), MetricError> {
         let name = reader.get_name().map_err(MetricError::Capnp)?.into();
         let mut name = MetricName::new(name, None);
         name.find_tag_pos(true);
@@ -202,7 +188,7 @@ where
 
         // we should NOT use Metric::new here because it is not a newly created metric
         // we'd get duplicate value in timer/set metrics if we used new
-        let metric: Metric<F> = Metric { value: value, mtype, timestamp, sampling, update_counter: if let Some(c) = up_counter { c } else { 1 } };
+        let metric: Metric<F> = Metric { value, mtype, timestamp, sampling, update_counter: if let Some(c) = up_counter { c } else { 1 } };
 
         Ok((name, metric))
     }
@@ -286,7 +272,7 @@ impl<F> IntoIterator for Metric<F>
 where
     F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
-    type Item = (&'static str, F);
+    type Item = (Option<Aggregate<F>>, F);
     type IntoIter = MetricIter<F>;
     fn into_iter(self) -> Self::IntoIter {
         MetricIter::new(self)
@@ -323,38 +309,39 @@ impl<F> Iterator for MetricIter<F>
 where
     F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
-    type Item = (&'static str, F);
+    type Item = (Option<Aggregate<F>>, F);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let res: Option<Self::Item> = match &self.m.mtype {
-            &MetricType::Counter if self.count == 0 => Some(("", self.m.value.into())),
-            &MetricType::DiffCounter(_) if self.count == 0 => Some(("", self.m.value.into())),
-            &MetricType::Gauge(_) if self.count == 0 => Some(("", self.m.value.into())),
-            &MetricType::Timer(ref agg) => {
+        let res: Option<Self::Item> = match self.m.mtype {
+            MetricType::Counter if self.count == 0 => Some((None, self.m.value)),
+            MetricType::DiffCounter(_) if self.count == 0 => Some((None, self.m.value)),
+            MetricType::Gauge(_) if self.count == 0 => Some((None, self.m.value)),
+            MetricType::Timer(ref agg) => {
                 match self.count {
-                    0 => Some(("count", F::from_f64(agg.len() as f64))),
+                    0 => Some((Some(Aggregate::Count), F::from_f64(agg.len() as f64))),
                     // agg.len() = 0 is impossible here because of metric creation logic.
                     // For additional panic safety and to ensure unwrapping is safe here
                     // this will return None interrupting the iteration and making other
                     // aggregations unreachable since they are useless in that case
-                    1 => agg.last().map(|last| ("last", (*last).into())),
-                    2 => Some(("min", agg[0])),
-                    3 => Some(("max", agg[agg.len() - 1])),
-                    4 => Some(("sum", self.timer_sum.unwrap())),
-                    5 => Some(("median", percentile(agg, F::from_f64(0.5)))),
+                    1 => agg.last().map(|last| (Some(Aggregate::Last), (*last))),
+                    2 => Some((Some(Aggregate::Min), agg[0])),
+                    3 => Some((Some(Aggregate::Max), agg[agg.len() - 1])),
+                    4 => Some((Some(Aggregate::Sum), self.timer_sum.unwrap())),
+                    5 => Some((Some(Aggregate::Median), percentile(agg, F::from_f64(0.5)))),
                     6 => {
                         let len: F = F::from_f64(agg.len() as f64);
-                        Some(("mean", self.timer_sum.unwrap() / len))
+                        Some((Some(Aggregate::Mean), self.timer_sum.unwrap() / len))
                     }
-                    7 => Some(("percentile.75", percentile(agg, F::from_f64(0.75)))),
-                    8 => Some(("percentile.95", percentile(agg, F::from_f64(0.95)))),
-                    9 => Some(("percentile.98", percentile(agg, F::from_f64(0.98)))),
-                    10 => Some(("percentile.99", percentile(agg, F::from_f64(0.99)))),
-                    11 => Some(("percentile.999", percentile(agg, F::from_f64(0.999)))),
+                    7 => Some((Some(Aggregate::UpdateCount), F::from_f64(f64::from(self.m.update_counter)))),
+                    8 => Some((Some(Aggregate::Percentile(F::from_f64(0.75))), percentile(agg, F::from_f64(0.75)))),
+                    9 => Some((Some(Aggregate::Percentile(F::from_f64(0.95))), percentile(agg, F::from_f64(0.95)))),
+                    10 => Some((Some(Aggregate::Percentile(F::from_f64(0.98))), percentile(agg, F::from_f64(0.98)))),
+                    11 => Some((Some(Aggregate::Percentile(F::from_f64(0.99))), percentile(agg, F::from_f64(0.99)))),
+                    12 => Some((Some(Aggregate::Percentile(F::from_f64(0.999))), percentile(agg, F::from_f64(0.999)))),
                     _ => None,
                 }
             }
-            &MetricType::Set(ref hs) if self.count == 0 => Some(("", F::from_f64(hs.len() as f64))),
+            MetricType::Set(ref hs) if self.count == 0 => Some((None, F::from_f64(hs.len() as f64))),
             _ => None,
         };
         self.count += 1;
@@ -383,7 +370,7 @@ mod tests {
     fn test_metric_capnp_counter() {
         let mut metric1 = Metric::new(1f64, MetricType::Counter, Some(10), Some(0.1)).unwrap();
         let metric2 = Metric::new(2f64, MetricType::Counter, None, None).unwrap();
-        metric1.aggregate(metric2).unwrap();
+        metric1.accumulate(metric2).unwrap();
         capnp_test(metric1);
     }
 
@@ -391,7 +378,7 @@ mod tests {
     fn test_metric_capnp_diffcounter() {
         let mut metric1 = Metric::new(1f64, MetricType::DiffCounter(0.1f64), Some(20), Some(0.2)).unwrap();
         let metric2 = Metric::new(1f64, MetricType::DiffCounter(0.5f64), None, None).unwrap();
-        metric1.aggregate(metric2).unwrap();
+        metric1.accumulate(metric2).unwrap();
         capnp_test(metric1);
     }
 
@@ -399,7 +386,7 @@ mod tests {
     fn test_metric_capnp_timer() {
         let mut metric1 = Metric::new(1f64, MetricType::Timer(Vec::new()), Some(10), Some(0.1)).unwrap();
         let metric2 = Metric::new(2f64, MetricType::Timer(vec![3f64]), None, None).unwrap();
-        metric1.aggregate(metric2).unwrap();
+        metric1.accumulate(metric2).unwrap();
         assert!(if let MetricType::Timer(ref v) = metric1.mtype { v.len() == 3 } else { false });
 
         capnp_test(metric1);
@@ -409,7 +396,7 @@ mod tests {
     fn test_metric_capnp_gauge() {
         let mut metric1 = Metric::new(1f64, MetricType::Gauge(None), Some(10), Some(0.1)).unwrap();
         let metric2 = Metric::new(2f64, MetricType::Gauge(Some(-1)), None, None).unwrap();
-        metric1.aggregate(metric2).unwrap();
+        metric1.accumulate(metric2).unwrap();
 
         capnp_test(metric1);
     }
@@ -422,7 +409,7 @@ mod tests {
         let mut set2 = HashSet::new();
         set2.extend(vec![10u64, 30u64].into_iter());
         let metric2 = Metric::new(2f64, MetricType::Set(set2), None, None).unwrap();
-        metric1.aggregate(metric2).unwrap();
+        metric1.accumulate(metric2).unwrap();
 
         capnp_test(metric1);
     }

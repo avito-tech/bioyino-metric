@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod metric;
 pub mod name;
 pub mod parser;
