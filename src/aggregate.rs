@@ -1,5 +1,7 @@
+use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
+use std::str::FromStr;
 
 use num_traits::{AsPrimitive, Float};
 use serde_derive::{Deserialize, Serialize};
@@ -44,6 +46,7 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields, try_from = "String")]
 pub enum Aggregate<F>
 where
     F: Float + Debug + FromF64 + AsPrimitive<usize>,
@@ -56,8 +59,44 @@ where
     Median,
     Mean,
     UpdateCount,
+    #[serde(skip)]
     AggregateTag,
     Percentile(F),
+}
+
+impl<F> TryFrom<String> for Aggregate<F>
+where
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
+{
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "count" => Ok(Aggregate::Count),
+            "last" => Ok(Aggregate::Last),
+            "min" => Ok(Aggregate::Min),
+            "max" => Ok(Aggregate::Max),
+            "sum" => Ok(Aggregate::Sum),
+            "median" => Ok(Aggregate::Median),
+            "updates" => Ok(Aggregate::UpdateCount),
+            s if s.starts_with("percentile-") => {
+                // check in match guarantees minus char exists
+                let pos = s.chars().position(|c| c == '-').unwrap() + 1;
+                let num: u64 = u64::from_str(&s[pos..]).map_err(|_| "percentile value is not unsigned integer".to_owned())?;
+                let mut divider = 10f64;
+
+                let num = num as f64;
+                // divider is f64, so it's always bigger than u64:MAX and therefore never
+                // overflow
+                while num > divider {
+                    divider *= 10.0;
+                }
+
+                Ok(Aggregate::Percentile(F::from_f64(num / divider)))
+            }
+            _ => Err("".into()),
+        }
+    }
 }
 
 impl<F> Hash for Aggregate<F>
