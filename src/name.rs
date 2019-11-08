@@ -35,6 +35,7 @@ pub enum AggregationDestination {
 
 /// Contains buffer containing the full metric name including tags
 /// and some data to split tags from name useful for appending aggregates
+///
 #[derive(Debug, Eq, Clone)]
 pub struct MetricName {
     pub name: BytesMut,
@@ -47,10 +48,12 @@ impl MetricName {
         Self { name, tag_pos /*tags: BTreeMap::new()*/ }
     }
 
-    /// find position where tags start, forcing re-search when it's already found
+    // TODO example
+    /// find position where tags start, optionally forcing re-search when it's already found
+    /// Note, that found position points to the first semicolon, not the tags part itself
     pub fn find_tag_pos(&mut self, force: bool) -> bool {
         if force || self.tag_pos.is_none() {
-            self.tag_pos = self.name.iter().position(|c| *c == b';')
+            self.tag_pos = self.name.iter().position(|c| *c == b';');
         }
         self.tag_pos.is_some()
     }
@@ -185,13 +188,16 @@ impl MetricName {
     /// sorting is made lexicographically
     pub fn sort_tags<B: AsMut<[u8]>>(&mut self, mode: TagFormat, intermediate: &mut B) -> Result<(), ()> {
         if self.tag_pos.is_none() && !self.find_tag_pos(true) {
-            return Err(());
+            // tag position was not found, so no tags
+            // but it is ok since we have nothing to sort
+            return Ok(());
         }
 
         let intermediate: &mut [u8] = intermediate.as_mut();
-        if intermediate.len() < self.name.len() - self.tag_pos.unwrap() {
+        if intermediate.len() < (self.name.len() - self.tag_pos.unwrap()) {
             return Err(());
         }
+
         use lazysort::Sorted;
         match mode {
             TagFormat::Graphite => {
@@ -206,6 +212,7 @@ impl MetricName {
                 }
                 offset -= 1;
                 let tp = self.tag_pos.unwrap() + 1;
+
                 self.name[tp..].copy_from_slice(&intermediate[..offset]);
             }
         }
@@ -326,6 +333,14 @@ mod tests {
 
     #[test]
     fn metric_name_sort_tags_graphite() {
+        let mut intermediate: Vec<u8> = Vec::new();
+        let mut name = MetricName::new(BytesMut::from(&b"gorets2;tag3=shit;t2=fuck"[..]), None);
+        name.find_tag_pos(false);
+        if intermediate.len() < name.name.len() {
+            intermediate.resize(name.name.len(), 0u8);
+        }
+        assert!(name.sort_tags(TagFormat::Graphite, &mut intermediate).is_ok());
+
         let mut name = MetricName::new(BytesMut::from(&b"gorets.bobez;t=y;a=b;c=e;u=v;c=d;c=b;aaa=z"[..]), None);
         name.find_tag_pos(false);
         let tag_pos = name.tag_pos.unwrap();
@@ -334,11 +349,12 @@ mod tests {
         assert_eq!(tag_len, 30);
 
         //let mut intermediate = Vec::with_capacity(tag_len);
+
         let mut intermediate = BytesMut::new();
         intermediate.resize(tag_len - 1, 0u8); // intentionally resize to less bytes than required
         assert!(name.sort_tags(TagFormat::Graphite, &mut intermediate).is_err());
 
-        intermediate.put(0u8);
+        intermediate.put(0u8); // resize to good length now
         assert!(name.sort_tags(TagFormat::Graphite, &mut intermediate).is_ok());
         assert_eq!(&name.name[..], &b"gorets.bobez;a=b;aaa=z;c=b;c=d;c=e;t=y;u=v"[..]);
     }

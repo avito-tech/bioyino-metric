@@ -132,9 +132,9 @@ where
     choice((
         // valid metric with (probably) tags
         (skip_many(newline()), name_with_tags, metric, skip_many(newline())).map(|(_, (start, tag, stop), m, _)| ParsedPart::Metric((start, stop), tag, m)),
-        (take_until_range(&b"\n"[..]), position(), skip_many1(newline())).map(|(_, pos, _)| ParsedPart::Trash(pos)),
+        (take_until_range(&b"\n"[..]), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::Trash(pos)),
         // trash not ending with \n, but too long to be metric
-        (take(max_unparsed), position()).map(|(_, pos)| ParsedPart::TotalTrash(pos)),
+        (take(max_unparsed), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::TotalTrash(pos)),
     ))
 }
 
@@ -218,7 +218,7 @@ where
                     // tag_pos is counted relative to input buffer
                     // but we need it to be relative to name
                     // to be related correctly, we have to shift it to `start` bytes right
-                    let tag_pos = tag_pos.map(|pos| pos.translate_position(input) - start);
+                    let tag_pos = tag_pos.map(|pos| pos.translate_position(input) - start - 1);
 
                     // before touching the buffer calculate position to advance after name
                     let metriclen = consumed - stop;
@@ -436,8 +436,8 @@ mod tests {
         let (name, metric) = parser.next().unwrap();
         // name is still full string, including tags
         assert_eq!(&name.name[..], &b"gorets;a=b;c=d"[..]);
-        assert_eq!(name.tag_pos, Some(7usize));
-        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b"a=b;c=d"[..]);
+        assert_eq!(name.tag_pos, Some(6usize));
+        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";a=b;c=d"[..]);
         assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, None).unwrap());
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
@@ -454,13 +454,30 @@ mod tests {
     #[test]
     fn parse_many_metrics_with_long_tags() {
         // metric with long tags followed by another metric
-        let mut data = BytesMut::from(&b"gorets;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b:+1000|g\nbobets;c=d:1000|g"[..]);
+        let mut data = BytesMut::from(&b"gorets;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b;a=b:+1000|g\n\nbobets;c=d:1000|g\n\n"[..]);
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"bobets;c=d"[..]);
-        assert_eq!(name.tag_pos, Some(7usize));
-        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b"c=d"[..]);
+        assert_eq!(name.tag_pos, Some(6usize));
+        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";c=d"[..]);
         assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(None), None, None).unwrap());
+    }
+
+    #[test]
+    fn parse_trashed_metric_with_tags() {
+        let mut data = BytesMut::new();
+        data.extend_from_slice(b"trash\ngorets1:+1000|g\nTRASH\n\n\ngorets2;tag3=shit;t2=fuck:-1000|g|@0.5\nMORE;tra=sh;|TrasH\nFUUU");
+        let mut parser = make_parser(&mut data);
+        let (name, metric) = parser.next().unwrap();
+        assert_eq!(&name.name[..], &b"gorets1"[..]);
+        assert_eq!(name.tag_pos, None);
+        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, None).unwrap());
+
+        let (name, metric) = parser.next().unwrap();
+        assert_eq!(&name.name[..], &b"gorets2;tag3=shit;t2=fuck"[..]);
+        assert_eq!(name.tag_pos, Some(7usize));
+        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";tag3=shit;t2=fuck"[..]);
+        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
     }
 
     #[test]
