@@ -22,6 +22,7 @@ pub enum TagFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum AggregationDestination {
     /// place depending on tags existence, if they do - always place in tag
     Smart,
