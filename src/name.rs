@@ -135,49 +135,54 @@ impl MetricName {
         buf.put_slice(tag);
     }
 
-    //fn put_with_value_tag(&self, buf: &mut BytesMut, tag: &[u8], value: f64) {
-    //    let namelen = self.name.len();
-
-    //FIXME
-    /*
-    let mut addlen = namelen + agglen + 1 + 32; // 1 is for `=`, 32 is for the float value itself
-    if !semicolon {
-        addlen += 1 // add one more for `;`
-    };
-    buf.reserve(addlen);
-    buf.put_slice(&self.name);
-    if !semicolon {
-        buf.put(b';');
-    }
-    buf.put_slice(agg_name);
-    buf.put(b'=');
-    buf.put_slice(&self.name[pos..]);
-    */
-    //}
-
     /// puts a name with an aggregate to provided buffer depending on dest
     /// expects tag_pos to be already found
-    pub fn put_with_aggregate<F>(&self, buf: &mut BytesMut, dest: AggregationDestination, agg: Aggregate<F>, replacements: &HashMap<Aggregate<F>, String>) -> Result<(), ()>
+    pub fn put_with_aggregate<F>(
+        // rustfmt
+        &self,
+        buf: &mut BytesMut,
+        dest: AggregationDestination,
+        agg: &Aggregate<F>,
+        postfix_replacements: &HashMap<Aggregate<F>, String>,
+        tag_replacements: &HashMap<Aggregate<F>, String>,
+    ) -> Result<(), ()>
     where
         F: Float + Debug + FromF64 + AsPrimitive<usize>,
     {
-        let agg_name = replacements.get(&agg).ok_or(())?.as_bytes();
-        let agg_tag = replacements.get(&Aggregate::AggregateTag).ok_or(())?.as_bytes();
+        // we should not use let agg_postfix before the match, because with the tag case we don't
+        // need it
+        // the same applies to tag name and value: we only need them when aggregating to tags
 
         match dest {
             AggregationDestination::Smart if self.tag_pos.is_none() => {
+                let agg_postfix = postfix_replacements.get(agg).ok_or(())?.as_bytes();
                 // metric is untagged, add aggregate to name
-                Ok(self.put_with_suffix(buf, agg_name))
+                Ok(self.put_with_suffix(buf, agg_postfix))
             }
             AggregationDestination::Smart => {
+                let agg_tag_name = tag_replacements.get(&Aggregate::AggregateTag).ok_or(())?.as_bytes();
+                let agg_tag_value = tag_replacements.get(agg).ok_or(())?.as_bytes();
+
                 // metric is tagged, add aggregate as tag
-                Ok(self.put_with_fixed_tag(buf, agg_tag, agg_name, false))
+                Ok(self.put_with_fixed_tag(buf, agg_tag_name, agg_tag_value, false))
             }
-            AggregationDestination::Name => Ok(self.put_with_suffix(buf, agg_name)),
-            AggregationDestination::Tag => Ok(self.put_with_fixed_tag(buf, agg_tag, agg_name, false)),
+            AggregationDestination::Name => {
+                let agg_postfix = postfix_replacements.get(agg).ok_or(())?.as_bytes();
+                Ok(self.put_with_suffix(buf, agg_postfix))
+            }
+            AggregationDestination::Tag => {
+                let agg_tag_name = tag_replacements.get(&Aggregate::AggregateTag).ok_or(())?.as_bytes();
+                let agg_tag_value = tag_replacements.get(agg).ok_or(())?.as_bytes();
+
+                Ok(self.put_with_fixed_tag(buf, agg_tag_name, agg_tag_value, false))
+            }
             AggregationDestination::Both => {
-                self.put_with_suffix(buf, agg_name);
-                self.put_with_fixed_tag(buf, agg_tag, agg_name, true);
+                let agg_postfix = postfix_replacements.get(agg).ok_or(())?.as_bytes();
+                let agg_tag_name = tag_replacements.get(&Aggregate::AggregateTag).ok_or(())?.as_bytes();
+                let agg_tag_value = tag_replacements.get(agg).ok_or(())?.as_bytes();
+
+                self.put_with_suffix(buf, agg_postfix);
+                self.put_with_fixed_tag(buf, agg_tag_name, agg_tag_value, true);
                 Ok(())
             }
         }
@@ -285,9 +290,15 @@ mod tests {
     #[test]
     fn metric_aggregate_modes() {
         // create some replacements
-        let mut replacements: HashMap<Aggregate<f64>, String> = HashMap::new();
-        replacements.insert(Aggregate::Count, "count".to_string());
-        replacements.insert(Aggregate::AggregateTag, "aggregate".to_string());
+        let mut p_reps: HashMap<Aggregate<f64>, String> = HashMap::new();
+        p_reps.insert(Aggregate::Count, "count".to_string());
+        p_reps.insert(Aggregate::AggregateTag, "MUST NOT BE USED".to_string());
+        p_reps.insert(Aggregate::Percentile(0.8f64), "percentile80".to_string());
+
+        let mut t_reps: HashMap<Aggregate<f64>, String> = HashMap::new();
+        t_reps.insert(Aggregate::Count, "cnt".to_string());
+        t_reps.insert(Aggregate::AggregateTag, "agg".to_string());
+        // intentionally skip adding percentile80
 
         let mut without_tags = MetricName::new(BytesMut::from(&b"gorets.bobez"[..]), None);
         let mut with_tags = MetricName::new(BytesMut::from(&b"gorets.bobez;tag=value"[..]), None);
@@ -299,36 +310,62 @@ mod tests {
         // create 0-size buffer to make sure allocation counts work as intended
         let mut buf = BytesMut::new();
 
-        assert!(without_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Max, &replacements).is_err());
+        // --------- without_tags
 
-        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &replacements).unwrap();
+        // max is not in replacements
+        assert!(without_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Max, &p_reps, &t_reps).is_err(), "non existing replacement gave no error");
+
+        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Count, &p_reps, &t_reps).unwrap();
         assert_eq!(&buf.take()[..], &b"gorets.bobez.count"[..]);
 
-        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Name, Aggregate::Count, &replacements).unwrap();
+        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Percentile(0.8f64), &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
+
+        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Name, &Aggregate::Count, &p_reps, &t_reps).unwrap();
         assert_eq!(&buf.take()[..], &b"gorets.bobez.count"[..]);
 
-        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Tag, Aggregate::Count, &replacements).unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez;aggregate=count"[..]);
+        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Name, &Aggregate::Percentile(0.8f64), &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
 
-        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Both, Aggregate::Count, &replacements).unwrap();
-        dbg!(&buf);
-        assert_eq!(&buf.take()[..], &b"gorets.bobez.count;aggregate=count"[..]);
+        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Tag, &Aggregate::Count, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez;agg=cnt"[..]);
 
-        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &replacements).unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez;tag=value;aggregate=count"[..]);
+        let err = without_tags.put_with_aggregate(&mut buf, AggregationDestination::Tag, &Aggregate::Percentile(0.8f64), &p_reps, &t_reps);
+        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
 
-        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Name, Aggregate::Count, &replacements).unwrap();
+        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Both, &Aggregate::Count, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez.count;agg=cnt"[..]);
+
+        let err = without_tags.put_with_aggregate(&mut buf, AggregationDestination::Both, &Aggregate::Percentile(0.8f64), &p_reps, &t_reps);
+        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
+
+        // --------- with_tags
+        assert!(with_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Max, &p_reps, &t_reps).is_err());
+
+        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Count, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez;tag=value;agg=cnt"[..]);
+
+        let err = with_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Percentile(0.8f64), &p_reps, &t_reps);
+        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
+
+        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Name, &Aggregate::Count, &p_reps, &t_reps).unwrap();
         assert_eq!(&buf.take()[..], &b"gorets.bobez.count;tag=value"[..]);
 
-        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Tag, Aggregate::Count, &replacements).unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez;tag=value;aggregate=count"[..]);
+        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Tag, &Aggregate::Count, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez;tag=value;agg=cnt"[..]);
 
-        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Both, Aggregate::Count, &replacements).unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez.count;tag=value;aggregate=count"[..]);
+        let err = with_tags.put_with_aggregate(&mut buf, AggregationDestination::Tag, &Aggregate::Percentile(0.8f64), &p_reps, &t_reps);
+        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
+
+        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Both, &Aggregate::Count, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez.count;tag=value;agg=cnt"[..]);
+
+        let err = with_tags.put_with_aggregate(&mut buf, AggregationDestination::Both, &Aggregate::Percentile(0.8f64), &p_reps, &t_reps);
+        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
 
         // ensure trailing semicolon is not duplicated
-        with_semicolon.put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &replacements).unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez;aggregate=count"[..]);
+        with_semicolon.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Count, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez;agg=cnt"[..]);
     }
 
     #[test]
