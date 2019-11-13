@@ -136,18 +136,6 @@ where
         Ok(())
     }
 
-    /// aggregates matric with apecified aggregate
-    pub fn aggregate(&self, agg: &Aggregate<F>, cached_sum: &mut Option<F>) -> Option<F>
-    where
-        F: Float + Debug + AsPrimitive<f64> + AsPrimitive<usize> + FromF64 + Sync,
-    {
-        match self.mtype {
-            MetricType::Timer(ref values) => agg.calculate(values, cached_sum, f64::from(self.update_counter)),
-            _ if agg == &Aggregate::UpdateCount => agg.calculate(&Vec::new(), cached_sum, f64::from(self.update_counter)),
-            _ => None,
-        }
-    }
-
     pub fn from_capnp(reader: cmetric::Reader) -> Result<(MetricName, Metric<F>), MetricError> {
         let name = reader.get_name().map_err(MetricError::Capnp)?.into();
         let mut name = MetricName::new(name, None);
@@ -279,6 +267,7 @@ where
     }
 }
 
+//#[deprecated(since = "0.1.0", note = "iterator only iterates over non-customized metrics, use aggregate method")]
 pub struct MetricIter<F>
 where
     F: Float + Debug + FromF64 + AsPrimitive<usize>,

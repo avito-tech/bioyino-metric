@@ -6,7 +6,7 @@ use std::str::FromStr;
 use num_traits::{AsPrimitive, Float};
 use serde_derive::{Deserialize, Serialize};
 
-use crate::metric::FromF64;
+use crate::metric::{FromF64, Metric, MetricType};
 
 // Percentile counter. Not safe. Requires at least two elements in vector
 // vector must be sorted
@@ -51,6 +51,8 @@ pub enum Aggregate<F>
 where
     F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
+    #[serde(skip)]
+    Value,
     Count,
     Last,
     Min,
@@ -105,11 +107,29 @@ where
 {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            Aggregate::Percentile(f) => {
-                let u: usize = f.as_(); //.rotate_left(5);
-                u.hash(state)
+            Aggregate::Value => 0usize.hash(state),
+            Aggregate::Count => 1usize.hash(state),
+            Aggregate::Last => 2usize.hash(state),
+            Aggregate::Min => 3usize.hash(state),
+            Aggregate::Max => 4usize.hash(state),
+            Aggregate::Sum => 5usize.hash(state),
+            Aggregate::Median => 6usize.hash(state),
+            Aggregate::Mean => 7usize.hash(state),
+            Aggregate::UpdateCount => 8usize.hash(state),
+            Aggregate::AggregateTag => 9usize.hash(state),
+            // we need this for hashing and comparison, so we just use a value different from other
+            // enum values
+            // the second thing we need here is correctness, so nobody could send us some strange
+            // percentile value like inf or nan (maybe there will be no such case, but just for the
+            // sake of correctness we'd better do this
+            Aggregate::Percentile(p) if !p.is_finite() => 11usize.hash(state), //std::usize::MAX,
+            Aggregate::Percentile(p) => {
+                let (mantissa, exponent, sign) = Float::integer_decode(*p);
+                11usize.hash(state);
+                mantissa.hash(state);
+                exponent.hash(state);
+                sign.hash(state);
             }
-            p => p.as_usize().hash(state),
         }
     }
 }
@@ -123,12 +143,26 @@ where
 {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Aggregate::Percentile(f), Aggregate::Percentile(o)) => {
-                let s: usize = f.as_().rotate_left(5);
-                let o: usize = o.as_().rotate_left(5);
-                s == o
+            (Aggregate::Count, Aggregate::Count) => true,
+            (Aggregate::Last, Aggregate::Last) => true,
+            (Aggregate::Min, Aggregate::Min) => true,
+            (Aggregate::Max, Aggregate::Max) => true,
+            (Aggregate::Sum, Aggregate::Sum) => true,
+            (Aggregate::Median, Aggregate::Median) => true,
+            (Aggregate::Mean, Aggregate::Mean) => true,
+            (Aggregate::UpdateCount, Aggregate::UpdateCount) => true,
+            (Aggregate::AggregateTag, Aggregate::AggregateTag) => true,
+            // we need this for hashing and comparison, so we just use a value different from other
+            // percentile value like inf or nan (maybe there will be no such case, but just for the
+            // sake of correctness we'd better do this
+            (Aggregate::Percentile(p), Aggregate::Percentile(o)) => {
+                if p.is_normal() && o.is_normal() {
+                    Float::integer_decode(*p) == Float::integer_decode(*o)
+                } else {
+                    p.classify() == o.classify()
+                }
             }
-            (s, o) => s.as_usize() == o.as_usize(),
+            _ => false,
         }
     }
 }
@@ -137,55 +171,87 @@ impl<F> Aggregate<F>
 where
     F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
-    fn as_usize(&self) -> usize {
-        match self {
-            Aggregate::Count => 0,
-            Aggregate::Last => 1,
-            Aggregate::Min => 2,
-            Aggregate::Max => 3,
-            Aggregate::Sum => 4,
-            Aggregate::Median => 5,
-            Aggregate::Mean => 6,
-            Aggregate::UpdateCount => 7,
-            Aggregate::AggregateTag => 8,
-            // we need this for hashing and comparison, so we just use a value different from other
-            // enum values
-            // the second thing we need here is correctness, so nobody could send us some strange
-            // percentile value like inf or nan (maybe there will be no such case, but just for the
-            // sake of correctness we'd better do this
-            Aggregate::Percentile(p) if !p.is_finite() => std::usize::MAX,
-            Aggregate::Percentile(p) if *p > FromF64::from_f64(std::usize::MAX as f64) => std::usize::MAX,
-            Aggregate::Percentile(p) => (*p + FromF64::from_f64(10f64)).as_(),
+    /// calculates the corresponding aggregate from the input metric
+    /// returne None in all inapplicable cases, like zero-length vector or metric type mismatch
+    /// cached_sum must relate to the same metric between calls, giving incorrect results or
+    /// panics otherwise
+    pub fn calculate(&self, metric: &Metric<F>, cached_sum: &mut Option<F>) -> Option<F> {
+        // TODO: test
+        match metric.mtype {
+            // for sets calculate only count
+            MetricType::Set(ref hs) if self == &Aggregate::Count => Some(F::from_f64(hs.len() as f64)),
+            // don't count values for timers and sets
+            MetricType::Set(_) if self == &Aggregate::Value => None,
+            MetricType::Timer(_) if self == &Aggregate::Value => None,
+            // for timers calculate all aggregates
+            MetricType::Timer(ref agg) => match self {
+                Aggregate::Value => None,
+                Aggregate::Count => Some(F::from_f64(agg.len() as f64)),
+                Aggregate::Last => agg.last().copied(),
+                Aggregate::Min => Some(agg[0]),
+                Aggregate::Max => Some(agg[agg.len() - 1]),
+                Aggregate::Sum => {
+                    fill_cached_sum(agg, cached_sum);
+                    cached_sum.map(|sum| sum)
+                }
+                Aggregate::Median => Some(percentile(agg, F::from_f64(0.5))),
+                Aggregate::Mean => {
+                    // the case with len = 0 and sum != None is real here, but we intentinally let it
+                    // panic on division by zero to get incorrect usage from code to be explicit
+                    fill_cached_sum(agg, cached_sum);
+                    cached_sum.map(|sum| {
+                        let len: F = F::from_f64(agg.len() as f64);
+                        sum / len
+                    })
+                }
+                Aggregate::UpdateCount => Some(F::from_f64(f64::from(metric.update_counter))),
+                Aggregate::AggregateTag => None,
+                Aggregate::Percentile(ref p) => Some(percentile(agg, *p)),
+            },
+            // cout value for all types except timers (matched above)
+            _ if self == &Aggregate::Value => Some(metric.value),
+            // for other types calculate only update counter
+            _ if self == &Aggregate::UpdateCount => Some(F::from_f64(f64::from(metric.update_counter))),
+            _ => None,
         }
     }
-    /// calculates the corresponding aggregate from the input vector
-    /// may return none if length of agg if data is required for aggregate to be count
-    /// agg and cached_sum must relate to the same metric between calls, giving incorrect results or
-    /// panics otherwise
-    pub fn calculate(&self, agg: &[F], cached_sum: &mut Option<F>, update_count: f64) -> Option<F> {
-        match self {
-            Aggregate::Count => Some(F::from_f64(agg.len() as f64)),
-            Aggregate::Last => agg.last().copied(),
-            Aggregate::Min => Some(agg[0]),
-            Aggregate::Max => Some(agg[agg.len() - 1]),
-            Aggregate::Sum => {
-                fill_cached_sum(agg, cached_sum);
-                cached_sum.map(|sum| sum)
-            }
-            Aggregate::Median => Some(percentile(agg, F::from_f64(0.5))),
-            Aggregate::Mean => {
-                // the case with len = 0 and sum != None is real here, but we intentinally let it
-                // panic on division by zero to get incorrect usage from code to be explicit
-                fill_cached_sum(agg, cached_sum);
-                cached_sum.map(|sum| {
-                    let len: F = F::from_f64(agg.len() as f64);
-                    sum / len
-                })
-            }
+}
 
-            Aggregate::UpdateCount => Some(F::from_f64(update_count)),
-            Aggregate::AggregateTag => None,
-            Aggregate::Percentile(ref p) => Some(percentile(agg, *p)),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+
+    #[test]
+    fn aggregates_eq_and_hashing_f32() {
+        let c32: Aggregate<f32> = Aggregate::Count;
+        assert!(c32 != Aggregate::Min);
+
+        assert!(Aggregate::Percentile(0.75f32) != Aggregate::Percentile(0.999));
+
+        let mut hm = HashMap::new();
+        // ensure hashing works good for typical percentiles up to 99999
+        for p in 1..100_000u32 {
+            hm.insert(Aggregate::Percentile(1f32 / p as f32), ());
+            hm.insert(Aggregate::Percentile(1f32 / p as f32), ());
         }
+        assert_eq!(hm.len(), 100000 - 1);
+    }
+
+    #[test]
+    fn aggregates_eq_and_hashing_f64() {
+        let c64: Aggregate<f64> = Aggregate::Count;
+        assert!(c64 != Aggregate::Min);
+
+        assert!(Aggregate::Percentile(0.75f64) != Aggregate::Percentile(0.999f64));
+
+        let mut hm = HashMap::new();
+        // ensure hashing works good for typical percentiles up to 99999
+        for p in 1..100_000u32 {
+            hm.insert(Aggregate::Percentile(1f64 / f64::from(p)), ());
+            hm.insert(Aggregate::Percentile(1f64 / f64::from(p)), ());
+        }
+        assert_eq!(hm.len(), 100000 - 1);
     }
 }
