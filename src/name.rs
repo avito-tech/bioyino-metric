@@ -59,6 +59,11 @@ impl MetricName {
         self.tag_pos.is_some()
     }
 
+    /// true if metric is tagged
+    pub fn has_tags(&mut self) -> bool {
+        self.tag_pos.is_some()
+    }
+
     /// returns only name, without tags, considers tag position was already found before
     pub fn name_without_tags(&self) -> &[u8] {
         if let Some(pos) = self.tag_pos {
