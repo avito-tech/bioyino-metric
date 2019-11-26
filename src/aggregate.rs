@@ -80,6 +80,7 @@ where
             "max" => Ok(Aggregate::Max),
             "sum" => Ok(Aggregate::Sum),
             "median" => Ok(Aggregate::Median),
+            "mean" => Ok(Aggregate::Mean),
             "updates" => Ok(Aggregate::UpdateCount),
             s if s.starts_with("percentile-") => {
                 // check in match guarantees minus char exists
@@ -176,7 +177,6 @@ where
     /// cached_sum must relate to the same metric between calls, giving incorrect results or
     /// panics otherwise
     pub fn calculate(&self, metric: &Metric<F>, cached_sum: &mut Option<F>) -> Option<F> {
-        // TODO: test
         match metric.mtype {
             // for sets calculate only count
             MetricType::Set(ref hs) if self == &Aggregate::Count => Some(F::from_f64(hs.len() as f64)),
