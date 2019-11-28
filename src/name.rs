@@ -155,6 +155,14 @@ impl MetricName {
     where
         F: Float + Debug + FromF64 + AsPrimitive<usize>,
     {
+        // for value aggregate ignore replacements and other shit
+        if agg == &Aggregate::Value {
+            let namelen = self.name.len();
+            buf.reserve(namelen);
+            buf.put_slice(&self.name);
+            return Ok(());
+        }
+
         // we should not use let agg_postfix before the match, because with the tag case we don't
         // need it
         // the same applies to tag name and value: we only need them when aggregating to tags
@@ -321,6 +329,9 @@ mod tests {
         // max is not in replacements
         assert!(without_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Max, &p_reps, &t_reps).is_err(), "non existing replacement gave no error");
 
+        without_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Value, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez"[..]);
+
         without_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Count, &p_reps, &t_reps).unwrap();
         assert_eq!(&buf.take()[..], &b"gorets.bobez.count"[..]);
 
@@ -348,6 +359,9 @@ mod tests {
         // --------- with_tags
         assert!(with_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Max, &p_reps, &t_reps).is_err());
 
+        with_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Value, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez;tag=value"[..]);
+
         with_tags.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Count, &p_reps, &t_reps).unwrap();
         assert_eq!(&buf.take()[..], &b"gorets.bobez;tag=value;agg=cnt"[..]);
 
@@ -370,6 +384,9 @@ mod tests {
         assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
 
         // ensure trailing semicolon is not duplicated
+        with_semicolon.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Value, &p_reps, &t_reps).unwrap();
+        assert_eq!(&buf.take()[..], &b"gorets.bobez;"[..]);
+
         with_semicolon.put_with_aggregate(&mut buf, AggregationDestination::Smart, &Aggregate::Count, &p_reps, &t_reps).unwrap();
         assert_eq!(&buf.take()[..], &b"gorets.bobez;agg=cnt"[..]);
     }
