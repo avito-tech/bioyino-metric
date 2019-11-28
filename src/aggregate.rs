@@ -144,6 +144,7 @@ where
 {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Aggregate::Value, Aggregate::Value) => true,
             (Aggregate::Count, Aggregate::Count) => true,
             (Aggregate::Last, Aggregate::Last) => true,
             (Aggregate::Min, Aggregate::Min) => true,
@@ -177,14 +178,14 @@ where
     /// cached_sum must relate to the same metric between calls, giving incorrect results or
     /// panics otherwise
     pub fn calculate(&self, metric: &Metric<F>, cached_sum: &mut Option<F>) -> Option<F> {
-        match metric.mtype {
+        match (&metric.mtype, self) {
             // for sets calculate only count
-            MetricType::Set(ref hs) if self == &Aggregate::Count => Some(F::from_f64(hs.len() as f64)),
+            (MetricType::Set(ref hs), &Aggregate::Count) => Some(F::from_f64(hs.len() as f64)),
             // don't count values for timers and sets
-            MetricType::Set(_) if self == &Aggregate::Value => None,
-            MetricType::Timer(_) if self == &Aggregate::Value => None,
+            (MetricType::Set(_), &Aggregate::Value) => None,
+            (MetricType::Timer(_), &Aggregate::Value) => None,
             // for timers calculate all aggregates
-            MetricType::Timer(ref agg) => match self {
+            (MetricType::Timer(ref agg), s) => match s {
                 Aggregate::Value => None,
                 Aggregate::Count => Some(F::from_f64(agg.len() as f64)),
                 Aggregate::Last => agg.last().copied(),
@@ -209,11 +210,58 @@ where
                 Aggregate::Percentile(ref p) => Some(percentile(agg, *p)),
             },
             // cout value for all types except timers (matched above)
-            _ if self == &Aggregate::Value => Some(metric.value),
+            (_, &Aggregate::Value) => Some(metric.value),
             // for other types calculate only update counter
-            _ if self == &Aggregate::UpdateCount => Some(F::from_f64(f64::from(metric.update_counter))),
+            (_, &Aggregate::UpdateCount) => Some(F::from_f64(f64::from(metric.update_counter))),
             _ => None,
         }
+    }
+}
+
+/// A state for calculating all aggregates over metric
+/// Implements iterator returning the index of aggregate in the input and the aggregate value
+/// if such value should exist for an aggregate
+pub struct AggregateCalculator<'a, F>
+where
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
+{
+    metric: &'a Metric<F>,
+    timer_sum: Option<F>,
+    aggregates: &'a [Aggregate<F>],
+    current: usize,
+}
+
+impl<'a, F> AggregateCalculator<'a, F>
+where
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
+{
+    pub fn new(metric: &'a mut Metric<F>, aggregates: &'a [Aggregate<F>]) -> Self {
+        let timer_sum = if let MetricType::Timer(ref mut agg) = metric.mtype {
+            agg.sort_unstable_by(|ref v1, ref v2| v1.partial_cmp(v2).unwrap());
+            let first = agg.first().unwrap();
+            Some(agg.iter().skip(1).fold(*first, |acc, &v| acc + v))
+        } else {
+            None
+        };
+        Self { metric, timer_sum, aggregates, current: 0 }
+    }
+}
+
+impl<'a, F> Iterator for AggregateCalculator<'a, F>
+where
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
+{
+    type Item = Option<(usize, F)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.aggregates.len() {
+            return None;
+        }
+
+        let agg = &self.aggregates[self.current];
+        let calc = agg.calculate(self.metric, &mut self.timer_sum).map(|result| (self.current, result));
+        self.current += 1;
+        Some(calc)
     }
 }
 
@@ -221,7 +269,7 @@ where
 mod tests {
     use super::*;
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn aggregates_eq_and_hashing_f32() {
@@ -253,5 +301,155 @@ mod tests {
             hm.insert(Aggregate::Percentile(1f64 / f64::from(p)), ());
         }
         assert_eq!(hm.len(), 100000 - 1);
+    }
+
+    #[test]
+    fn aggregating_with_iterator() {
+        // create aggregates list
+        // this also tests all aggregates are parsed
+        let aggregates = vec!["count", "min", "updates", "max", "sum", "median", "percentile-85"];
+        let mut aggregates = aggregates.into_iter().map(|s| Aggregate::try_from(s.to_string()).unwrap()).collect::<Vec<Aggregate<f64>>>();
+        // add hidden value aggregator
+        aggregates.push(Aggregate::Value);
+
+        let samples = vec![12f64, 43f64, 1f64, 9f64, 84f64, 55f64, 31f64, 16f64, 64f64];
+        let mut expected = HashMap::new();
+
+        let mut metrics = Vec::new();
+        aggregates.iter().map(|agg| expected.insert(agg.clone(), Vec::new())).last();
+        // NOTE: when modifying this test, push expected aggregates to vector in the same order as `aggregates` vector
+        // (this is needed for equality test to work as intended)
+
+        // TODO: gauge signs
+        let mut gauge = Metric::new(1f64, MetricType::Gauge(None), None, None).unwrap();
+        samples
+            .iter()
+            .map(|t| {
+                let gauge2 = Metric::new(*t, MetricType::Gauge(None), None, None).unwrap();
+                gauge.accumulate(gauge2).unwrap();
+            })
+            .last();
+
+        metrics.push(gauge.clone());
+
+        // gauges only consider last value
+        expected.get_mut(&Aggregate::Value).unwrap().push((gauge.clone(), 64f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((gauge.clone(), 10f64));
+
+        // counters must be aggregated into two aggregates: value and update counter
+        let mut counter = Metric::new(1f64, MetricType::Counter, None, None).unwrap();
+        let mut sign = 1f64;
+        samples
+            .iter()
+            .map(|t| {
+                sign = -sign;
+                let counter2 = Metric::new(*t * sign, MetricType::Counter, None, None).unwrap();
+                counter.accumulate(counter2).unwrap();
+            })
+            .last();
+
+        metrics.push(counter.clone());
+
+        // aggregated value for counter is a sum of all incoming data considering signs
+        expected.get_mut(&Aggregate::Value).unwrap().push((counter.clone(), -68f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((counter.clone(), 10f64));
+
+        // diff counter is when you send a counter value as is, but it's considered increasing and
+        // only positive diff adds up
+        let mut dcounter = Metric::new(1f64, MetricType::DiffCounter(0.0), None, Some(0.1)).unwrap();
+        samples
+            .iter()
+            .map(|t| {
+                let dcounter2 = Metric::new(*t, MetricType::DiffCounter(0.0), None, Some(0.1)).unwrap();
+                dcounter.accumulate(dcounter2).unwrap();
+            })
+            .last();
+
+        metrics.push(dcounter.clone());
+
+        expected.get_mut(&Aggregate::Value).unwrap().push((dcounter.clone(), 278f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((dcounter.clone(), 10f64));
+
+        // timers should be properly aggregated into all agregates except value
+        let mut timer = Metric::new(1f64, MetricType::Timer(Vec::new()), None, None).unwrap();
+
+        samples
+            .iter()
+            .map(|t| {
+                let timer2 = Metric::new(*t, MetricType::Timer(Vec::new()), None, None).unwrap();
+                timer.accumulate(timer2).unwrap();
+            })
+            .last();
+
+        expected.get_mut(&Aggregate::Count).unwrap().push((timer.clone(), 10f64));
+        expected.get_mut(&Aggregate::Min).unwrap().push((timer.clone(), 1f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((timer.clone(), 10f64));
+        expected.get_mut(&Aggregate::Max).unwrap().push((timer.clone(), 84f64));
+        expected.get_mut(&Aggregate::Sum).unwrap().push((timer.clone(), 316f64));
+        // percentiles( 0.5 and 0.85 ) was counted in google spreadsheets
+        expected.get_mut(&Aggregate::Median).unwrap().push((timer.clone(), 23.5f64));
+        expected.get_mut(&Aggregate::Percentile(0.85)).unwrap().push((timer.clone(), 60.85f64));
+        metrics.push(timer);
+
+        // sets should be properly aggregated into count of uniques and update count
+        let mut set = Metric::new(1f64, MetricType::Set(HashSet::new()), None, None).unwrap();
+
+        samples
+            .iter()
+            .map(|t| {
+                let set2 = Metric::new(*t, MetricType::Set(HashSet::new()), None, None).unwrap();
+                set.accumulate(set2).unwrap();
+            })
+            .last();
+
+        expected.get_mut(&Aggregate::Count).unwrap().push((set.clone(), 9f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((set.clone(), 10f64));
+        // percentiles( 0.5 and 0.85 ) was counted in google spreadsheets
+        metrics.push(set);
+
+        let mut results = HashMap::new();
+        metrics
+            .into_iter()
+            .map(|metric| {
+                let mut calc_metric = metric.clone();
+                let calculator = AggregateCalculator::new(&mut calc_metric, &aggregates);
+                calculator
+                    //                    .inspect(|res| {
+                    //dbg!(res);
+                    //})
+                    // count all of them that are countable (filtering None) and leaving the aggregate itself
+                    .filter_map(|result| result)
+                    // set corresponding name
+                    .map(|(idx, value)| {
+                        // it would be better to use metric as a key, but it doesn't implement Eq,
+                        // so atm we trick it this way
+                        if !results.contains_key(&aggregates[idx]) {
+                            results.insert(aggregates[idx].clone(), Vec::new());
+                        }
+                        results.get_mut(&aggregates[idx]).unwrap().push((metric.clone(), value));
+                    })
+                    .last();
+            })
+            .last();
+
+        //dbg!(&expected, &results);
+        assert_eq!(expected.len(), results.len(), "expected len does not match results len");
+        for (ec, ev) in &expected {
+            //dbg!(ec);
+            let rv = results.get(ec).expect("expected key not found in results");
+            assert_eq!(ev.len(), rv.len());
+            // for percentile a value can be a bit not equal
+            if ec == &Aggregate::Percentile(0.85f64) {
+                ev.iter()
+                    .zip(rv.iter())
+                    .map(|((_, e), (_, r))| {
+                        let diff = (e - r).abs();
+                        assert!(diff < 0.0001, format!("{} ~= {}: {}", e, r, diff));
+                    })
+                    .last();
+            } else {
+                assert_eq!(ev, rv);
+            }
+        }
     }
 }

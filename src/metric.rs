@@ -7,7 +7,6 @@ use failure::Error;
 use failure_derive::Fail;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::aggregate::{percentile, Aggregate};
 use crate::name::MetricName;
 use crate::protocol_capnp::{gauge, metric as cmetric, metric_type};
 
@@ -76,6 +75,14 @@ impl FromF64 for f32 {
         sign_f * mantissa_f * exponent_f
     }
 }
+// TODO
+//impl<F> Eq for Metric<F>
+//F: PartialEq,
+//{
+//fn eq(&self, other: &Self) -> bool {
+////self.self.value == other.value
+//}
+//}
 
 impl<F> Metric<F>
 where
@@ -253,88 +260,6 @@ where
             self.fill_capnp(&mut root);
         }
         builder
-    }
-}
-
-impl<F> IntoIterator for Metric<F>
-where
-    F: Float + Debug + FromF64 + AsPrimitive<usize>,
-{
-    type Item = (Option<Aggregate<F>>, F);
-    type IntoIter = MetricIter<F>;
-    fn into_iter(self) -> Self::IntoIter {
-        MetricIter::new(self)
-    }
-}
-
-//#[deprecated(since = "0.1.0", note = "iterator only iterates over non-customized metrics, use aggregate method")]
-pub struct MetricIter<F>
-where
-    F: Float + Debug + FromF64 + AsPrimitive<usize>,
-{
-    m: Metric<F>,
-    count: usize,
-    // cached sum to avoid recounting
-    timer_sum: Option<F>,
-}
-
-impl<F> MetricIter<F>
-where
-    F: Float + Debug + FromF64 + AsPrimitive<usize>,
-{
-    fn new(mut metric: Metric<F>) -> Self {
-        let sum = if let MetricType::Timer(ref mut agg) = metric.mtype {
-            agg.sort_unstable_by(|ref v1, ref v2| v1.partial_cmp(v2).unwrap());
-            let first = agg.first().unwrap();
-            Some(agg.iter().skip(1).fold(*first, |acc, &v| acc + v))
-        } else {
-            None
-        };
-        MetricIter { m: metric, count: 0, timer_sum: sum }
-    }
-}
-
-impl<F> Iterator for MetricIter<F>
-where
-    F: Float + Debug + FromF64 + AsPrimitive<usize>,
-{
-    type Item = (Option<Aggregate<F>>, F);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let res: Option<Self::Item> = match self.m.mtype {
-            MetricType::Counter if self.count == 0 => Some((None, self.m.value)),
-            MetricType::DiffCounter(_) if self.count == 0 => Some((None, self.m.value)),
-            MetricType::Gauge(_) if self.count == 0 => Some((None, self.m.value)),
-            MetricType::Timer(ref agg) => {
-                match self.count {
-                    0 => Some((Some(Aggregate::Count), F::from_f64(agg.len() as f64))),
-                    // agg.len() = 0 is impossible here because of metric creation logic.
-                    // For additional panic safety and to ensure unwrapping is safe here
-                    // this will return None interrupting the iteration and making other
-                    // aggregations unreachable since they are useless in that case
-                    1 => agg.last().map(|last| (Some(Aggregate::Last), (*last))),
-                    2 => Some((Some(Aggregate::Min), agg[0])),
-                    3 => Some((Some(Aggregate::Max), agg[agg.len() - 1])),
-                    4 => Some((Some(Aggregate::Sum), self.timer_sum.unwrap())),
-                    5 => Some((Some(Aggregate::Median), percentile(agg, F::from_f64(0.5)))),
-                    6 => {
-                        let len: F = F::from_f64(agg.len() as f64);
-                        Some((Some(Aggregate::Mean), self.timer_sum.unwrap() / len))
-                    }
-                    7 => Some((Some(Aggregate::UpdateCount), F::from_f64(f64::from(self.m.update_counter)))),
-                    8 => Some((Some(Aggregate::Percentile(F::from_f64(0.75))), percentile(agg, F::from_f64(0.75)))),
-                    9 => Some((Some(Aggregate::Percentile(F::from_f64(0.95))), percentile(agg, F::from_f64(0.95)))),
-                    10 => Some((Some(Aggregate::Percentile(F::from_f64(0.98))), percentile(agg, F::from_f64(0.98)))),
-                    11 => Some((Some(Aggregate::Percentile(F::from_f64(0.99))), percentile(agg, F::from_f64(0.99)))),
-                    12 => Some((Some(Aggregate::Percentile(F::from_f64(0.999))), percentile(agg, F::from_f64(0.999)))),
-                    _ => None,
-                }
-            }
-            MetricType::Set(ref hs) if self.count == 0 => Some((None, F::from_f64(hs.len() as f64))),
-            _ => None,
-        };
-        self.count += 1;
-        res
     }
 }
 
