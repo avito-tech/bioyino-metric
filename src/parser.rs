@@ -16,7 +16,7 @@ use combine::{optional, skip_many1, Parser};
 use bytes::BytesMut;
 
 use crate::metric::{FromF64, Metric, MetricType};
-use crate::name::MetricName;
+use crate::name::{sort_tags, MetricName, TagFormat};
 use num_traits::{AsPrimitive, Float};
 
 /// Used for returning parsing result
@@ -35,7 +35,10 @@ where
 /// (TODO: code example)
 ///
 /// It's current goal is to be fast, use less allocs and to not depend on error and even probably input typing
-pub fn metric_stream_parser<'a, I, F>(max_unparsed: usize, max_tags_len: usize) -> impl Parser<Input = I, Output = ParsedPart<F>, PartialState = impl Default + 'a>
+pub fn metric_stream_parser<'a, I, F>(
+    max_unparsed: usize,
+    max_tags_len: usize,
+) -> impl Parser<Input = I, Output = ParsedPart<F>, PartialState = impl Default + 'a>
 where
     I: RangeStream<Item = u8, Range = &'a [u8], Position = PointerOffset> + std::fmt::Debug,
     I::Error: ParseError<I::Item, I::Range, I::Position>,
@@ -100,7 +103,9 @@ where
 
     let sampling = (bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
         // TODO replace from_utf8 with handmade parser removing recognize
-        from_utf8(val).map_err(StreamErrorFor::<I>::other).map(|v| v.parse::<f32>().map_err(StreamErrorFor::<I>::other))?
+        from_utf8(val)
+            .map_err(StreamErrorFor::<I>::other)
+            .map(|v| v.parse::<f32>().map_err(StreamErrorFor::<I>::other))?
     });
 
     let metric = (
@@ -157,6 +162,7 @@ pub struct MetricParser<'a, F, E: ParseErrorHandler> {
     max_unparsed: usize,
     max_tags_len: usize,
     handler: E,
+    sort_buf: Vec<u8>,
     _pd: PhantomData<F>,
 }
 
@@ -165,7 +171,17 @@ where
     E: ParseErrorHandler,
 {
     pub fn new(input: &'a mut BytesMut, max_unparsed: usize, max_tags_len: usize, handler: E) -> Self {
-        Self { input, skip: 0, max_unparsed, max_tags_len, handler, _pd: PhantomData }
+        let mut sort_buf = Vec::with_capacity(max_unparsed);
+        sort_buf.resize(max_unparsed, 0u8);
+        Self {
+            input,
+            skip: 0,
+            max_unparsed,
+            max_tags_len,
+            handler,
+            sort_buf,
+            _pd: PhantomData,
+        }
     }
 }
 
@@ -235,13 +251,21 @@ where
                     self.input.advance(start);
 
                     // now we can cut the name itself
-                    let name = self.input.split_to(stop - start);
+                    let mut name = self.input.split_to(stop - start);
 
                     self.input.advance(metriclen);
 
                     self.skip = 0;
 
-                    return Some((MetricName::new(name, tag_pos), metric));
+                    if let Some(pos) = tag_pos {
+                        // with tag_pos found we need to try to sort tags
+                        //
+                        // since the buffer is created by ourselves, we are responsible for it's size, so
+                        // it's WAY better to panic here if buffer size is incorrect
+                        sort_tags(&mut name[..], TagFormat::Graphite, &mut self.sort_buf, pos).unwrap();
+                    }
+
+                    return Some((MetricName::from_raw_parts(name.freeze(), tag_pos), metric));
                 }
                 Ok((Some(ParsedPart::Trash(pos)), consumed)) => {
                     // trash matched
@@ -473,10 +497,11 @@ mod tests {
         assert_eq!(name.tag_pos, None);
         assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, None).unwrap());
 
+        // parser must sort tags
         let (name, metric) = parser.next().unwrap();
-        assert_eq!(&name.name[..], &b"gorets2;tag3=shit;t2=fuck"[..]);
+        assert_eq!(&name.name[..], &b"gorets2;t2=fuck;tag3=shit"[..]);
         assert_eq!(name.tag_pos, Some(7usize));
-        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";tag3=shit;t2=fuck"[..]);
+        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";t2=fuck;tag3=shit"[..]);
         assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
     }
 
@@ -485,7 +510,28 @@ mod tests {
         let mut data = BytesMut::new();
         data.extend_from_slice(b"gorets1:+1001|g\nT\x01RAi:|\x01SH\nnuggets2:-1002|s|@0.5\nMORETrasH\nFUUU\n\ngorets3:+1003|ggorets4:+1004|ms:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::ggorets5:1005|ms");
 
-        let correct = vec![(Bytes::from("gorets1"), Metric::<f64>::new(1001f64, MetricType::Gauge(Some(1)), None, None).unwrap()), (Bytes::from("nuggets2"), Metric::<f64>::new(-1002f64, MetricType::Set(HashSet::new()), None, Some(0.5)).unwrap()), (Bytes::from("gorets3"), Metric::<f64>::new(1003f64, MetricType::Gauge(Some(1)), None, None).unwrap()), (Bytes::from("gorets4"), Metric::<f64>::new(1004f64, MetricType::Timer(Vec::new()), None, None).unwrap()), (Bytes::from("gorets5"), Metric::<f64>::new(1005f64, MetricType::Timer(Vec::new()), None, None).unwrap())];
+        let correct = vec![
+            (
+                Bytes::from("gorets1"),
+                Metric::<f64>::new(1001f64, MetricType::Gauge(Some(1)), None, None).unwrap(),
+            ),
+            (
+                Bytes::from("nuggets2"),
+                Metric::<f64>::new(-1002f64, MetricType::Set(HashSet::new()), None, Some(0.5)).unwrap(),
+            ),
+            (
+                Bytes::from("gorets3"),
+                Metric::<f64>::new(1003f64, MetricType::Gauge(Some(1)), None, None).unwrap(),
+            ),
+            (
+                Bytes::from("gorets4"),
+                Metric::<f64>::new(1004f64, MetricType::Timer(Vec::new()), None, None).unwrap(),
+            ),
+            (
+                Bytes::from("gorets5"),
+                Metric::<f64>::new(1005f64, MetricType::Timer(Vec::new()), None, None).unwrap(),
+            ),
+        ];
         for i in 1..(data.len() + 1) {
             // this is out test case - partially received data
             let mut testinput = BytesMut::from(&data[0..i]);

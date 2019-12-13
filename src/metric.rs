@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 
+use bytes::Bytes;
 use capnp;
 use capnp::message::{Allocator, Builder, HeapAllocator};
 use failure::Error;
 use failure_derive::Fail;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::name::MetricName;
+use crate::name::{find_tag_pos, MetricName, TagFormat};
 use crate::protocol_capnp::{gauge, metric as cmetric, metric_type};
 
 use num_traits::{AsPrimitive, Float};
@@ -75,6 +76,7 @@ impl FromF64 for f32 {
         sign_f * mantissa_f * exponent_f
     }
 }
+
 // TODO
 //impl<F> Eq for Metric<F>
 //F: PartialEq,
@@ -89,7 +91,13 @@ where
     F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
 {
     pub fn new(value: F, mtype: MetricType<F>, timestamp: Option<u64>, sampling: Option<f32>) -> Result<Self, MetricError> {
-        let mut metric = Metric { value, mtype, timestamp, sampling, update_counter: 1 };
+        let mut metric = Metric {
+            value,
+            mtype,
+            timestamp,
+            sampling,
+            update_counter: 1,
+        };
 
         if let MetricType::Timer(ref mut agg) = metric.mtype {
             agg.push(metric.value)
@@ -144,9 +152,9 @@ where
     }
 
     pub fn from_capnp(reader: cmetric::Reader) -> Result<(MetricName, Metric<F>), MetricError> {
-        let name = reader.get_name().map_err(MetricError::Capnp)?.into();
-        let mut name = MetricName::new(name, None);
-        name.find_tag_pos(true);
+        let name: Bytes = reader.get_name().map_err(MetricError::Capnp)?.into();
+        let tag_pos = find_tag_pos(&name[..], TagFormat::Graphite);
+        let name = MetricName::from_raw_parts(name, tag_pos);
         let value: F = F::from_f64(reader.get_value());
 
         let mtype = reader.get_type().map_err(MetricError::Capnp)?;
@@ -174,16 +182,33 @@ where
             }
         };
 
-        let timestamp = if reader.has_timestamp() { Some(reader.get_timestamp().map_err(MetricError::Capnp)?.get_ts()) } else { None };
+        let timestamp = if reader.has_timestamp() {
+            Some(reader.get_timestamp().map_err(MetricError::Capnp)?.get_ts())
+        } else {
+            None
+        };
 
         let (sampling, up_counter) = match reader.get_meta() {
-            Ok(reader) => (if reader.has_sampling() { reader.get_sampling().ok().map(|reader| reader.get_sampling()) } else { None }, Some(reader.get_update_counter())),
+            Ok(reader) => (
+                if reader.has_sampling() {
+                    reader.get_sampling().ok().map(|reader| reader.get_sampling())
+                } else {
+                    None
+                },
+                Some(reader.get_update_counter()),
+            ),
             Err(_) => (None, None),
         };
 
         // we should NOT use Metric::new here because it is not a newly created metric
         // we'd get duplicate value in timer/set metrics if we used new
-        let metric: Metric<F> = Metric { value, mtype, timestamp, sampling, update_counter: if let Some(c) = up_counter { c } else { 1 } };
+        let metric: Metric<F> = Metric {
+            value,
+            mtype,
+            timestamp,
+            sampling,
+            update_counter: if let Some(c) = up_counter { c } else { 1 },
+        };
 
         Ok((name, metric))
     }

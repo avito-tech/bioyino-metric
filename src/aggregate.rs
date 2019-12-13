@@ -40,7 +40,11 @@ where
     F: Float,
 {
     if sum.is_none() {
-        let first = if let Some(first) = agg.first() { first } else { return };
+        let first = if let Some(first) = agg.first() {
+            first
+        } else {
+            return;
+        };
         *sum = Some(agg.iter().skip(1).fold(*first, |acc, &v| acc + v))
     }
 }
@@ -243,7 +247,12 @@ where
         } else {
             None
         };
-        Self { metric, timer_sum, aggregates, current: 0 }
+        Self {
+            metric,
+            timer_sum,
+            aggregates,
+            current: 0,
+        }
     }
 }
 
@@ -308,7 +317,10 @@ mod tests {
         // create aggregates list
         // this also tests all aggregates are parsed
         let aggregates = vec!["count", "min", "updates", "max", "sum", "median", "percentile-85"];
-        let mut aggregates = aggregates.into_iter().map(|s| Aggregate::try_from(s.to_string()).unwrap()).collect::<Vec<Aggregate<f64>>>();
+        let mut aggregates = aggregates
+            .into_iter()
+            .map(|s| Aggregate::try_from(s.to_string()).unwrap())
+            .collect::<Vec<Aggregate<f64>>>();
         // add hidden value aggregator
         aggregates.push(Aggregate::Value);
 
