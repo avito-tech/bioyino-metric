@@ -171,8 +171,7 @@ where
     E: ParseErrorHandler,
 {
     pub fn new(input: &'a mut BytesMut, max_unparsed: usize, max_tags_len: usize, handler: E) -> Self {
-        let mut sort_buf = Vec::with_capacity(max_unparsed);
-        sort_buf.resize(max_unparsed, 0u8);
+        let sort_buf = vec![0; max_unparsed];
         Self {
             input,
             skip: 0,

@@ -57,7 +57,7 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
             let mut offset = 0; // meaningful length of data in intermediate buffer
             let mut cutlen = 0; // length to cut from name because of removed empty tags
             for part in name.split(|c| *c == b';').skip(1).sorted() {
-                if part.len() == 0 {
+                if part.is_empty() {
                     //   offset += 1;
                     cutlen += 1;
                 } else {
@@ -82,9 +82,9 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
                 name[tag_pos + 1..newlen].copy_from_slice(&intermediate[..offset]);
             }
 
-            return Ok(newlen);
+            Ok(newlen)
         }
-    };
+    }
 }
 
 /// Contains buffer containing the full metric name including tags
@@ -310,11 +310,12 @@ impl MetricName {
     /// to avoid putting different aggregates into same names
     /// requires all replacements to exist, giving error otherwise
     /// does no checks on overriding though
+    #[allow(clippy::unit_arg)]
     pub fn put_with_aggregate<F>(
         // rustfmt
         &self,
         buf: &mut BytesMut,
-        dest: &AggregationDestination,
+        dest: AggregationDestination,
         agg: &Aggregate<F>,
         postfix_replacements: &HashMap<Aggregate<F>, String>,
         prefix_replacements: &HashMap<Aggregate<F>, String>,
@@ -333,7 +334,7 @@ impl MetricName {
 
         // find and put prefix first
         let prefix = prefix_replacements.get(agg).ok_or(())?;
-        if prefix.len() > 0 {
+        if !prefix.is_empty() {
             buf.reserve(prefix.len() + 1);
             buf.put(prefix);
             buf.put(b'.');
