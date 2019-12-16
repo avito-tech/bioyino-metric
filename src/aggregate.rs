@@ -49,11 +49,11 @@ where
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields, try_from = "String")]
 pub enum Aggregate<F>
 where
-    F: Float + Debug + FromF64 + AsPrimitive<usize>,
+    F: Copy + Float + Debug + FromF64 + AsPrimitive<usize>,
 {
     #[serde(skip)]
     Value,
