@@ -1,5 +1,8 @@
 # 0.2.0
 
+* aggregation API has changed, supporting custom percentiles, specifying a list of aggregates, etc
 * metric name is now a separate structure allowing to process tag information
-* tags are considered being graphite format and can be sorted so tagged metrics are matched correctly together
-* metric aggregation iterator now returns suffixes without leading dot for better usage as tags
+* metrics can now have tags in (yet only one) graphite format
+* tags are placed in sorted order during aggregation and parsing so they are always correct to be used without creating separate structure for them
+* aggregation modes are not supported to put aggregate names in tags or name postfixes
+* name prefixing is available per aggregate
