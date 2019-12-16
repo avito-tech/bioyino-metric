@@ -77,7 +77,7 @@ where
     type Error = String;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
+        match s.to_lowercase().as_str() {
             "count" => Ok(Aggregate::Count),
             "last" => Ok(Aggregate::Last),
             "min" => Ok(Aggregate::Min),
