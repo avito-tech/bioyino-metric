@@ -1,12 +1,12 @@
 [package]
 name = "bioyino-metric"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Sergey Noskov aka Albibek <albibek@gmail.com>"]
 description = "Library for handling metrics in bioyino and related projects"
 edition = "2018"
 license = "MIT"
 repository = "https://github.com/Albibek/bioyino-metric"
-keywords = ["statsd", "bioyino", "metric", "metrics"]
+keywords = ["statsd", "bioyino", "metric", "metrics", "graphite", "tags"]
 categories = ["parser-implementations", "network-programming"]
 
 [dependencies]
@@ -18,7 +18,7 @@ capnp = "^0.10"
 combine="^3.6"
 bytes = { version = "^0.4", features = [ "serde" ] }
 num-traits="^0.2"
+lazysort="^0.2"
 
 [build-dependencies]
 capnpc = "^0.10"
-
