@@ -45,6 +45,7 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A typed, optionally timestamped metric value (i.e. without name)
 pub struct Metric<F>
 where
     F: Copy + PartialEq + Debug,

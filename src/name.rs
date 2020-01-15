@@ -87,8 +87,8 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
     }
 }
 
-/// Contains buffer containing the full metric name including tags
-/// and some data to work with tags
+/// Represents a metric name as a buffer containing the full metric name including tags.
+/// Also provides methods to work with tags.
 #[derive(Debug, Eq, Clone)]
 pub struct MetricName {
     pub name: Bytes,
@@ -129,7 +129,7 @@ impl MetricName {
     }
 
     /// Assemble name from internal parts *without checks*. Tags must be sorted, tag position must
-    /// be found according to mode
+    /// be found according to required format
     pub fn from_raw_parts(name: Bytes, tag_pos: Option<usize>) -> Self {
         Self { name, tag_pos }
     }
@@ -302,10 +302,9 @@ impl MetricName {
         };
     }
 
-    /// puts a name with an aggregate to provided buffer depending on dest
-    /// to avoid putting different aggregates into same names
-    /// requires all replacements to exist, giving error otherwise
-    /// does no checks on overriding though
+    /// Puts a name with an aggregate to provided buffer depending on dest.
+    /// To avoid putting different aggregates into same names requires all replacements to exist, giving error otherwise.
+    /// Does no do the check if such overriding is done.
     #[allow(clippy::unit_arg)]
     pub fn put_with_aggregate<F>(
         // rustfmt

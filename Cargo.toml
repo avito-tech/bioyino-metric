@@ -6,7 +6,7 @@ description = "Library for handling metrics in bioyino and related projects"
 edition = "2018"
 license = "MIT"
 repository = "https://github.com/Albibek/bioyino-metric"
-keywords = ["statsd", "bioyino", "metric", "metrics"]
+keywords = ["statsd", "bioyino", "metric", "metrics", "graphite", "tags"]
 categories = ["parser-implementations", "network-programming"]
 
 [dependencies]

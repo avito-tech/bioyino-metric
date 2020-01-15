@@ -30,11 +30,9 @@ where
     TotalTrash(PointerOffset),
 }
 
-/// The parser signature may seem cryptic, but it can mostly be ignored totally and get used as
-/// simple as
-/// (TODO: code example)
-///
-/// It's current goal is to be fast, use less allocs and to not depend on error and even probably input typing
+// The current goal is to be fast, use less allocs and to not depend on error type. that's why
+// the signature may seem to be cryptic.
+/// Parse stream of multiple metrics in statsd format. Usage of MetricParser is recommended instead.
 pub fn metric_stream_parser<'a, I, F>(
     max_unparsed: usize,
     max_tags_len: usize,
@@ -146,16 +144,18 @@ where
 pub type MetricParsingError<'a> = easy::Errors<u8, &'a [u8], PointerOffset>;
 
 #[allow(unused_variables)]
+/// Used to handle parsing errors
 pub trait ParseErrorHandler {
     fn handle(&self, buf: &[u8], pos: usize, e: MetricParsingError) {}
 }
 
+/// Does nothing about error, can be used for ignoring all errors
 pub struct DummyParseErrorHandler;
 impl ParseErrorHandler for DummyParseErrorHandler {}
 
-// A high level parser to parse metric and split names from BytesMut
-// Follows an iterator pattern, which fires metrics untion it is possible
-// modifying the buffer on the fly
+/// A high level parser to parse metric and split names from BytesMut.
+/// Follows an iterator pattern, which fires metrics until it is possible,
+/// modifying the buffer on the fly
 pub struct MetricParser<'a, F, E: ParseErrorHandler> {
     input: &'a mut BytesMut,
     skip: usize,

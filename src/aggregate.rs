@@ -8,8 +8,8 @@ use serde_derive::{Deserialize, Serialize};
 
 use crate::metric::{FromF64, Metric, MetricType};
 
-// Percentile counter. Not safe. Requires at least two elements in vector
-// vector must be sorted
+/// Percentile counter. Not safe. Requires at least two elements in vector
+/// vector MUST be sorted
 pub fn percentile<F>(vec: &[F], nth: F) -> F
 where
     F: Float + AsPrimitive<usize>,
@@ -51,11 +51,13 @@ where
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields, try_from = "String")]
+/// Contains list of all possible aggregates and some additional data.
 pub enum Aggregate<F>
 where
     F: Copy + Float + Debug + FromF64 + AsPrimitive<usize>,
 {
     #[serde(skip)]
+    /// a dummy aggregate, containing metric's original value
     Value,
     Count,
     Last,
@@ -66,6 +68,8 @@ where
     Mean,
     UpdateCount,
     #[serde(skip)]
+    /// this is not really a metric aggregate, it is used in replacements definition to specify
+    /// tag name
     AggregateTag,
     Percentile(F),
 }
