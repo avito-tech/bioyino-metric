@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use num_traits::{AsPrimitive, Float};
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::aggregate::Aggregate;
 use crate::metric::FromF64;
@@ -193,14 +193,14 @@ impl MetricName {
             None => {
                 buf.put_slice(&self.name);
                 if suflen > 0 {
-                    buf.put(b'.');
+                    buf.put_u8(b'.');
                     buf.put_slice(suffix);
                 }
             }
             Some(pos) => {
                 buf.put_slice(&self.name[..pos]);
                 if suflen > 0 {
-                    buf.put(b'.');
+                    buf.put_u8(b'.');
                     buf.put_slice(suffix);
                 }
                 if with_tags {
@@ -230,10 +230,10 @@ impl MetricName {
                 }
                 // easy case: no tags
                 if self.name[namelen - 1] != b';' {
-                    buf.put(b';');
+                    buf.put_u8(b';');
                 }
                 buf.put_slice(tag_name);
-                buf.put(b'=');
+                buf.put_u8(b'=');
                 buf.put_slice(tag);
             }
             Some(pos) => {
@@ -264,20 +264,20 @@ impl MetricName {
 
                     // prepend new tag with semicolon if required
                     if self.name[namelen - 1] != b';' {
-                        buf.put(b';');
+                        buf.put_u8(b';');
                     }
 
                     // put new tag
                     buf.put_slice(tag_name);
-                    buf.put(b'=');
+                    buf.put_u8(b'=');
                     buf.put_slice(tag);
                 } else if offset == pos + 1 {
                     // new tag is put before all tags
 
                     // put the new tag with semicolon
-                    buf.put(b';');
+                    buf.put_u8(b';');
                     buf.put_slice(tag_name);
-                    buf.put(b'=');
+                    buf.put_u8(b'=');
                     buf.put_slice(tag);
 
                     // put other tags with leading semicolon
@@ -288,11 +288,11 @@ impl MetricName {
 
                     // put the new tag
                     buf.put_slice(tag_name);
-                    buf.put(b'=');
+                    buf.put_u8(b'=');
                     buf.put_slice(tag);
 
                     if self.name[offset] != b';' {
-                        buf.put(b';');
+                        buf.put_u8(b';');
                     }
 
                     buf.extend_from_slice(&self.name[offset..]);
@@ -331,8 +331,8 @@ impl MetricName {
         let prefix = prefix_replacements.get(&agg).ok_or(())?;
         if !prefix.is_empty() {
             buf.reserve(prefix.len() + 1);
-            buf.put(prefix);
-            buf.put(b'.');
+            buf.put_slice(prefix.as_bytes());
+            buf.put_u8(b'.');
         }
 
         // we should not use let agg_postfix before the match, because with the tag case we don't
@@ -399,7 +399,7 @@ mod tests {
     }
 
     fn assert_buf(buf: &mut BytesMut, match_: &[u8], error: &'static str) {
-        let res = &buf.take()[..];
+        let res = &buf.split()[..];
         assert_eq!(
             res,
             match_,
@@ -529,14 +529,14 @@ mod tests {
         without_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Value, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez"[..]);
+        assert_eq!(&buf.split()[..], &b"gorets.bobez"[..]);
 
         // update count is aggregated only with prefix
         without_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::UpdateCount, &po_reps, &pr_reps, &t_reps)
             .unwrap();
 
-        assert_eq!(&buf.take()[..], &b"updates.gorets.bobez"[..]);
+        assert_eq!(&buf.split()[..], &b"updates.gorets.bobez"[..]);
 
         with_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::UpdateCount, &po_reps, &pr_reps, &t_reps)
@@ -552,7 +552,7 @@ mod tests {
         without_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez.count"[..]);
+        assert_eq!(&buf.split()[..], &b"counts.gorets.bobez.count"[..]);
 
         without_tags
             .put_with_aggregate(
@@ -564,12 +564,12 @@ mod tests {
                 &t_reps,
             )
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
+        assert_eq!(&buf.split()[..], &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
 
         without_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Name, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez.count"[..]);
+        assert_eq!(&buf.split()[..], &b"counts.gorets.bobez.count"[..]);
 
         without_tags
             .put_with_aggregate(
@@ -581,12 +581,12 @@ mod tests {
                 &t_reps,
             )
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
+        assert_eq!(&buf.split()[..], &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
 
         without_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Tag, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez;agg=cnt"[..]);
+        assert_eq!(&buf.split()[..], &b"counts.gorets.bobez;agg=cnt"[..]);
 
         let err = without_tags.put_with_aggregate(
             &mut buf,
@@ -601,7 +601,7 @@ mod tests {
         without_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Both, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez.count;agg=cnt"[..]);
+        assert_eq!(&buf.split()[..], &b"counts.gorets.bobez.count;agg=cnt"[..]);
 
         let err = without_tags.put_with_aggregate(
             &mut buf,
@@ -621,12 +621,12 @@ mod tests {
         with_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Value, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez;tag=value"[..]);
+        assert_eq!(&buf.split()[..], &b"gorets.bobez;tag=value"[..]);
 
         with_tags
             .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez;agg=cnt;tag=value"[..]);
+        assert_eq!(&buf.split()[..], &b"counts.gorets.bobez;agg=cnt;tag=value"[..]);
 
         let err = with_tags.put_with_aggregate(
             &mut buf,
@@ -685,12 +685,12 @@ mod tests {
         with_semicolon
             .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Value, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez;"[..]);
+        assert_eq!(&buf.split()[..], &b"gorets.bobez;"[..]);
 
         with_semicolon
             .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez;agg=cnt"[..]);
+        assert_eq!(&buf.split()[..], &b"counts.gorets.bobez;agg=cnt"[..]);
     }
 
     #[test]

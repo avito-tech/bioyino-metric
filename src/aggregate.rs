@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 use num_traits::{AsPrimitive, Float};
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::metric::{FromF64, Metric, MetricType};
 

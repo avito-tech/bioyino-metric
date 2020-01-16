@@ -13,7 +13,7 @@ use combine::stream::{decode, PointerOffset, RangeStream, StreamErrorFor};
 use combine::{choice, position};
 use combine::{optional, skip_many1, Parser};
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 
 use crate::metric::{FromF64, Metric, MetricType};
 use crate::name::{sort_tags, MetricName, TagFormat};
@@ -440,8 +440,8 @@ mod tests {
         use bytes::BufMut;
         let mut data = BytesMut::from(&b"borets1"[..]);
         data.reserve(1000);
-        data.put(193u8);
-        data.put(129u8);
+        data.put_u8(193u8);
+        data.put_u8(129u8);
         data.put(&b":+1000|g\ngorets:-1000|g|@0.5"[..]);
         let mut parser = make_parser(&mut data);
         let r = parser.next();
