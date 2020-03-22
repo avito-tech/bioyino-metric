@@ -4,13 +4,13 @@ use std::marker::PhantomData;
 use std::str::from_utf8;
 use std::str::FromStr;
 
-use combine::byte::{byte, bytes, digit, newline};
-use combine::combinator::{eof, skip_many};
 use combine::error::{ParseError, StreamError};
+use combine::parser::byte::{byte, bytes as parse_bytes, digit, newline};
 use combine::parser::range::{recognize, take, take_until_range, take_while1};
 use combine::stream::easy;
 use combine::stream::{decode, PointerOffset, RangeStream, StreamErrorFor};
 use combine::{choice, position};
+use combine::{eof, skip_many};
 use combine::{optional, skip_many1, Parser};
 
 use bytes::{Buf, BytesMut};
@@ -20,26 +20,35 @@ use crate::name::{sort_tags, MetricName, TagFormat};
 use num_traits::{AsPrimitive, Float};
 
 /// Used for returning parsing result
+/*
+#[derive(Debug)]
+pub enum ParsedPart<F, I>
+where
+F: Float + FromStr + Debug + AsPrimitive<f64>,
+{
+Metric((PointerOffset<I>, PointerOffset<I>), Option<PointerOffset<I>>, Metric<F>),
+Trash(PointerOffset<I>),
+TotalTrash(PointerOffset<I>),
+}
+*/
+
 #[derive(Debug)]
 pub enum ParsedPart<F>
 where
     F: Float + FromStr + Debug + AsPrimitive<f64>,
 {
-    Metric((PointerOffset, PointerOffset), Option<PointerOffset>, Metric<F>),
-    Trash(PointerOffset),
-    TotalTrash(PointerOffset),
+    Metric((PointerOffset<[u8]>, PointerOffset<[u8]>), Option<PointerOffset<[u8]>>, Metric<F>),
+    Trash(PointerOffset<[u8]>),
+    TotalTrash(PointerOffset<[u8]>),
 }
 
 // The current goal is to be fast, use less allocs and to not depend on error type. that's why
 // the signature may seem to be cryptic.
 /// Parse stream of multiple metrics in statsd format. Usage of MetricParser is recommended instead.
-pub fn metric_stream_parser<'a, I, F>(
-    max_unparsed: usize,
-    max_tags_len: usize,
-) -> impl Parser<Input = I, Output = ParsedPart<F>, PartialState = impl Default + 'a>
+pub fn metric_stream_parser<'a, I, F>(max_unparsed: usize, max_tags_len: usize) -> impl Parser<I, Output = ParsedPart<F>, PartialState = impl Default + 'a>
 where
-    I: RangeStream<Item = u8, Range = &'a [u8], Position = PointerOffset> + std::fmt::Debug,
-    I::Error: ParseError<I::Item, I::Range, I::Position>,
+    I: 'a + combine::StreamOnce<Token = u8, Range = &'a [u8], Position = PointerOffset<[u8]>> + std::fmt::Debug + RangeStream,
+    I::Error: ParseError<I::Token, I::Range, I::Position>,
     F: 'a + Float + Debug + FromStr + AsPrimitive<f64> + FromF64 + Sync,
     <F as FromStr>::Err: std::error::Error + Sync + Send + 'static,
 {
@@ -83,7 +92,7 @@ where
         });
 
     // This parses metric type
-    let mtype = bytes(b"ms")
+    let mtype = parse_bytes(b"ms")
         //
         .map(|_| MetricType::Timer(Vec::<F>::new()))
         .or(byte(b'g').map(|_| MetricType::Gauge(None)))
@@ -99,7 +108,7 @@ where
             (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
         ));
 
-    let sampling = (bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
+    let sampling = (parse_bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
         // TODO replace from_utf8 with handmade parser removing recognize
         from_utf8(val)
             .map_err(StreamErrorFor::<I>::other)
@@ -141,7 +150,7 @@ where
     ))
 }
 
-pub type MetricParsingError<'a> = easy::Errors<u8, &'a [u8], PointerOffset>;
+pub type MetricParsingError<'a> = easy::Errors<u8, &'a [u8], PointerOffset<[u8]>>;
 
 #[allow(unused_variables)]
 /// Used to handle parsing errors
@@ -206,7 +215,7 @@ where
                 //combine::stream::PartialStream(input),
                 //&mut Default::default(),
                 //            );
-                decode(parser, combine::easy::Stream(input), &mut Default::default())
+                decode(parser, &mut combine::easy::Stream(input), &mut Default::default())
             };
 
             match res {
