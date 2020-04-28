@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
@@ -6,7 +7,7 @@ use std::str::FromStr;
 use num_traits::{AsPrimitive, Float};
 use serde::{Deserialize, Serialize};
 
-use crate::metric::{FromF64, Metric, MetricType};
+use crate::metric::{FromF64, Metric, MetricType, MetricTypeName};
 
 /// Percentile counter. Not safe. Requires at least two elements in vector
 /// vector MUST be sorted
@@ -67,11 +68,13 @@ where
     Median,
     Mean,
     UpdateCount,
-    #[serde(skip)]
-    /// this is not really a metric aggregate, it is used in replacements definition to specify
-    /// tag name
-    AggregateTag,
-    Percentile(F),
+    // user will want the exact same number formatting of percentile like in config, but
+    // float converstions from/to string may loose it, so
+    // we prefer to keep the percentile as is, with the original integer parsed from config value
+    // this is also VERY useful when comparing and hashing percentiles too
+    // the only one downside is that i.e. 0.8th and 0.800 th percentile will be different metrics,
+    // but same values, but this is easily acceptable and should be really very rare case
+    Percentile(F, u64),
 }
 
 impl<F> TryFrom<String> for Aggregate<F>
@@ -82,6 +85,7 @@ where
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.to_lowercase().as_str() {
+            "value" => Ok(Aggregate::Value),
             "count" => Ok(Aggregate::Count),
             "last" => Ok(Aggregate::Last),
             "min" => Ok(Aggregate::Min),
@@ -96,16 +100,37 @@ where
                 let num: u64 = u64::from_str(&s[pos..]).map_err(|_| "percentile value is not unsigned integer".to_owned())?;
                 let mut divider = 10f64;
 
-                let num = num as f64;
+                let numf = num as f64;
                 // divider is f64, so it's always bigger than u64:MAX and therefore never
                 // overflow
-                while num > divider {
+                while numf > divider {
                     divider *= 10.0;
                 }
 
-                Ok(Aggregate::Percentile(F::from_f64(num / divider)))
+                Ok(Aggregate::Percentile(F::from_f64(numf / divider), num))
             }
-            _ => Err("".into()),
+            _ => Err("unknown aggregate name".into()),
+        }
+    }
+}
+
+impl<F> ToString for Aggregate<F>
+where
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
+{
+    fn to_string(&self) -> String {
+        match self {
+            Aggregate::Value => "".to_string(),
+            Aggregate::Count => "count".to_string(),
+            Aggregate::Last => "last".to_string(),
+            Aggregate::Min => "min".to_string(),
+            Aggregate::Max => "max".to_string(),
+            Aggregate::Sum => "sum".to_string(),
+            Aggregate::Median => "median".to_string(),
+            Aggregate::Mean => "mean".to_string(),
+            Aggregate::UpdateCount => "updates".to_string(),
+            Aggregate::Percentile(p, _) if !p.is_finite() => "bad_percentile".to_string(),
+            Aggregate::Percentile(_, num) => format!("percentile.{}", num),
         }
     }
 }
@@ -125,19 +150,16 @@ where
             Aggregate::Median => 6usize.hash(state),
             Aggregate::Mean => 7usize.hash(state),
             Aggregate::UpdateCount => 8usize.hash(state),
-            Aggregate::AggregateTag => 9usize.hash(state),
             // we need this for hashing and comparison, so we just use a value different from other
             // enum values
             // the second thing we need here is correctness, so nobody could send us some strange
             // percentile value like inf or nan (maybe there will be no such case, but just for the
             // sake of correctness we'd better do this
-            Aggregate::Percentile(p) if !p.is_finite() => 11usize.hash(state), //std::usize::MAX,
-            Aggregate::Percentile(p) => {
-                let (mantissa, exponent, sign) = Float::integer_decode(*p);
-                11usize.hash(state);
-                mantissa.hash(state);
-                exponent.hash(state);
-                sign.hash(state);
+            Aggregate::Percentile(p, _) if !p.is_finite() => 11usize.hash(state), //std::usize::MAX,
+            Aggregate::Percentile(_, num) => {
+                // it's ok to hash only number here because that's how we differ percentiles from
+                // each other
+                num.hash(state);
             }
         }
     }
@@ -161,17 +183,10 @@ where
             (Aggregate::Median, Aggregate::Median) => true,
             (Aggregate::Mean, Aggregate::Mean) => true,
             (Aggregate::UpdateCount, Aggregate::UpdateCount) => true,
-            (Aggregate::AggregateTag, Aggregate::AggregateTag) => true,
             // we need this for hashing and comparison, so we just use a value different from other
             // percentile value like inf or nan (maybe there will be no such case, but just for the
             // sake of correctness we'd better do this
-            (Aggregate::Percentile(p), Aggregate::Percentile(o)) => {
-                if p.is_normal() && o.is_normal() {
-                    Float::integer_decode(*p) == Float::integer_decode(*o)
-                } else {
-                    p.classify() == o.classify()
-                }
-            }
+            (Aggregate::Percentile(_, num), Aggregate::Percentile(_, o)) => num == o,
             _ => false,
         }
     }
@@ -214,8 +229,7 @@ where
                     })
                 }
                 Aggregate::UpdateCount => Some(F::from_f64(f64::from(metric.update_counter))),
-                Aggregate::AggregateTag => None,
-                Aggregate::Percentile(ref p) => Some(percentile(agg, *p)),
+                Aggregate::Percentile(ref p, _) => Some(percentile(agg, *p)),
             },
             // cout value for all types except timers (matched above)
             (_, &Aggregate::Value) => Some(metric.value),
@@ -278,6 +292,35 @@ where
     }
 }
 
+/// A helper function giving all possible aggregates for each metric type name.
+/// Includes ony one, 99th percentile for the sake of complenetes
+pub fn possible_aggregates<F>() -> HashMap<MetricTypeName, Vec<Aggregate<F>>>
+where
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
+{
+    let mut map = HashMap::new();
+    map.insert(MetricTypeName::Counter, vec![Aggregate::Value, Aggregate::UpdateCount]);
+    map.insert(MetricTypeName::DiffCounter, vec![Aggregate::Value, Aggregate::UpdateCount]);
+
+    map.insert(
+        MetricTypeName::Timer,
+        vec![
+            Aggregate::Count,
+            Aggregate::Last,
+            Aggregate::Min,
+            Aggregate::Max,
+            Aggregate::Sum,
+            Aggregate::Median,
+            Aggregate::Mean,
+            Aggregate::UpdateCount,
+            Aggregate::Percentile(F::from_f64(0.99), 99),
+        ],
+    );
+    map.insert(MetricTypeName::Gauge, vec![Aggregate::Value, Aggregate::UpdateCount]);
+    map.insert(MetricTypeName::Set, vec![Aggregate::Count, Aggregate::UpdateCount]);
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,13 +332,13 @@ mod tests {
         let c32: Aggregate<f32> = Aggregate::Count;
         assert!(c32 != Aggregate::Min);
 
-        assert!(Aggregate::Percentile(0.75f32) != Aggregate::Percentile(0.999));
+        assert!(Aggregate::Percentile(0.75f32, 75) != Aggregate::Percentile(0.999, 999));
 
         let mut hm = HashMap::new();
         // ensure hashing works good for typical percentiles up to 99999
         for p in 1..100_000u32 {
-            hm.insert(Aggregate::Percentile(1f32 / p as f32), ());
-            hm.insert(Aggregate::Percentile(1f32 / p as f32), ());
+            hm.insert(Aggregate::Percentile(1f32 / p as f32, p as u64), ());
+            hm.insert(Aggregate::Percentile(1f32 / p as f32, p as u64), ());
         }
         assert_eq!(hm.len(), 100000 - 1);
     }
@@ -305,15 +348,23 @@ mod tests {
         let c64: Aggregate<f64> = Aggregate::Count;
         assert!(c64 != Aggregate::Min);
 
-        assert!(Aggregate::Percentile(0.75f64) != Aggregate::Percentile(0.999f64));
+        assert!(Aggregate::Percentile(0.75f64, 75) != Aggregate::Percentile(0.999f64, 999));
 
         let mut hm = HashMap::new();
         // ensure hashing works good for typical percentiles up to 99999
         for p in 1..100_000u32 {
-            hm.insert(Aggregate::Percentile(1f64 / f64::from(p)), ());
-            hm.insert(Aggregate::Percentile(1f64 / f64::from(p)), ());
+            hm.insert(Aggregate::Percentile(1f64 / f64::from(p), p as u64), ());
+            hm.insert(Aggregate::Percentile(1f64 / f64::from(p), p as u64), ());
         }
         assert_eq!(hm.len(), 100000 - 1);
+    }
+
+    #[test]
+    fn percentile_to_string() {
+        assert_eq!(&Aggregate::Percentile(0.75f64, 75).to_string(), "percentile.75");
+        assert_eq!(&Aggregate::Percentile(0.009f64, 9).to_string(), "percentile.9");
+        assert_eq!(&Aggregate::Percentile(0.8f64, 80).to_string(), "percentile.80");
+        assert_eq!(&Aggregate::Percentile(0.800f64, 800).to_string(), "percentile.800");
     }
 
     #[test]
@@ -404,7 +455,7 @@ mod tests {
         expected.get_mut(&Aggregate::Sum).unwrap().push((timer.clone(), 316f64));
         // percentiles( 0.5 and 0.85 ) was counted in google spreadsheets
         expected.get_mut(&Aggregate::Median).unwrap().push((timer.clone(), 23.5f64));
-        expected.get_mut(&Aggregate::Percentile(0.85)).unwrap().push((timer.clone(), 60.85f64));
+        expected.get_mut(&Aggregate::Percentile(0.85, 85)).unwrap().push((timer.clone(), 60.85f64));
         metrics.push(timer);
 
         // sets should be properly aggregated into count of uniques and update count
@@ -455,7 +506,7 @@ mod tests {
             let rv = results.get(ec).expect("expected key not found in results");
             assert_eq!(ev.len(), rv.len());
             // for percentile a value can be a bit not equal
-            if ec == &Aggregate::Percentile(0.85f64) {
+            if ec == &Aggregate::Percentile(0.85f64, 85) {
                 ev.iter()
                     .zip(rv.iter())
                     .map(|((_, e), (_, r))| {

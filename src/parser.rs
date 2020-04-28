@@ -104,8 +104,8 @@ where
         //
         .and(optional((byte(b'.'), skip_many1(digit()))))
         .and(optional(
-            //
-            (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
+                //
+                (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
         ));
 
     let sampling = (parse_bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
@@ -120,10 +120,10 @@ where
         val,
         mtype,
         choice((
-            sampling.map(Some),
-            skip_many(newline()).map(|_| None),
-            eof().map(|_| None),
-            //skip_many(newline()).map(|_| None),
+                sampling.map(Some),
+                skip_many(newline()).map(|_| None),
+                eof().map(|_| None),
+                //skip_many(newline()).map(|_| None),
         )),
     )
         .map(|(sign, mut val, mtype, sampling)| {
@@ -142,11 +142,11 @@ where
 
     // here's what we are trying to parse
     choice((
-        // valid metric with (probably) tags
-        (skip_many(newline()), name_with_tags, metric, skip_many(newline())).map(|(_, (start, tag, stop), m, _)| ParsedPart::Metric((start, stop), tag, m)),
-        (take_until_range(&b"\n"[..]), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::Trash(pos)),
-        // trash not ending with \n, but too long to be metric
-        (take(max_unparsed), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::TotalTrash(pos)),
+            // valid metric with (probably) tags
+            (skip_many(newline()), name_with_tags, metric, skip_many(newline())).map(|(_, (start, tag, stop), m, _)| ParsedPart::Metric((start, stop), tag, m)),
+            (take_until_range(&b"\n"[..]), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::Trash(pos)),
+            // trash not ending with \n, but too long to be metric
+            (take(max_unparsed), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::TotalTrash(pos)),
     ))
 }
 
@@ -324,7 +324,7 @@ where
                             Some(pos) => self.input.advance(pos),
                             None => self.input.clear(),
                         }
-                    //cut all the input otherwise
+                        //cut all the input otherwise
                     } else {
                         // cut buffer to position where error was found
                         self.skip = 0;
@@ -347,8 +347,13 @@ mod tests {
 
     struct TestParseErrorHandler;
     impl ParseErrorHandler for TestParseErrorHandler {
-        fn handle(&self, input: &[u8], pos: usize, e: MetricParsingError) {
-            println!("parse error at {:?} in {:?}: {:?}", pos, String::from_utf8_lossy(input), e);
+        fn handle(&self, input: &[u8], _: usize, e: MetricParsingError) {
+            println!(
+                "parse error at {:?} in {:?}: {:?}",
+                e.position.translate_position(input),
+                String::from_utf8_lossy(input),
+                e
+            );
         }
     }
 
@@ -463,13 +468,13 @@ mod tests {
 
     #[test]
     fn parse_metric_with_tags() {
-        let mut data = BytesMut::from(&b"gorets;a=b;c=d:+1000|g\ngorets:-1000|g|@0.5"[..]);
+        let mut data = BytesMut::from(&b"gorets;a=b.j.k.l;c=d:+1000|g\ngorets:-1000|g|@0.5"[..]);
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         // name is still full string, including tags
-        assert_eq!(&name.name[..], &b"gorets;a=b;c=d"[..]);
+        assert_eq!(&name.name[..], &b"gorets;a=b.j.k.l;c=d"[..]);
         assert_eq!(name.tag_pos, Some(6usize));
-        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";a=b;c=d"[..]);
+        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";a=b.j.k.l;c=d"[..]);
         assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, None).unwrap());
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
@@ -498,7 +503,7 @@ mod tests {
     #[test]
     fn parse_trashed_metric_with_tags() {
         let mut data = BytesMut::new();
-        data.extend_from_slice(b"trash\ngorets1:+1000|g\nTRASH\n\n\ngorets2;tag3=shit;t2=fuck:-1000|g|@0.5\nMORE;tra=sh;|TrasH\nFUUU");
+        data.extend_from_slice(b"trash\ngorets1:+1000|g\nTRASH\n\n\ngorets2;tag3=sh.t;t2=fuck:-1000|g|@0.5\nMORE;tra=sh;|TrasH\nFUUU");
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets1"[..]);
@@ -507,9 +512,9 @@ mod tests {
 
         // parser must sort tags
         let (name, metric) = parser.next().unwrap();
-        assert_eq!(&name.name[..], &b"gorets2;t2=fuck;tag3=shit"[..]);
+        assert_eq!(&name.name[..], &b"gorets2;t2=fuck;tag3=sh.t"[..]);
         assert_eq!(name.tag_pos, Some(7usize));
-        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";t2=fuck;tag3=shit"[..]);
+        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";t2=fuck;tag3=sh.t"[..]);
         assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
     }
 
@@ -539,7 +544,7 @@ mod tests {
                 Bytes::from("gorets5"),
                 Metric::<f64>::new(1005f64, MetricType::Timer(Vec::new()), None, None).unwrap(),
             ),
-        ];
+            ];
         for i in 1..(data.len() + 1) {
             // this is out test case - partially received data
             let mut testinput = BytesMut::from(&data[0..i]);

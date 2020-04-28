@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::fmt::Debug;
 
 use bytes::Bytes;
@@ -27,6 +28,9 @@ pub enum MetricError {
 
     #[error("schema error: {}", _0)]
     CapnpSchema(capnp::NotInSchema),
+
+    #[error("unknown type name '{}'", _0)]
+    BadTypeName(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,6 +290,64 @@ where
             self.fill_capnp(&mut root);
         }
         builder
+    }
+}
+
+/// Metric type specification simplified to use for naming in configs etc
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "&str")]
+pub enum MetricTypeName {
+    Default,
+    Counter,
+    DiffCounter,
+    Timer,
+    Gauge,
+    Set,
+}
+
+impl MetricTypeName {
+    pub fn from_metric<F>(m: &Metric<F>) -> Self
+    where
+        F: Copy + PartialEq + Debug,
+    {
+        match m.mtype {
+            MetricType::Counter => MetricTypeName::Counter,
+            MetricType::DiffCounter(_) => MetricTypeName::DiffCounter,
+            MetricType::Timer(_) => MetricTypeName::Timer,
+            MetricType::Gauge(_) => MetricTypeName::Gauge,
+            MetricType::Set(_) => MetricTypeName::Set,
+        }
+    }
+}
+
+impl TryFrom<&str> for MetricTypeName {
+    type Error = MetricError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "default" => Ok(MetricTypeName::Default),
+            "counter" => Ok(MetricTypeName::Counter),
+            "diff-counter" => Ok(MetricTypeName::DiffCounter),
+            "timer" => Ok(MetricTypeName::Timer),
+            "gauge" => Ok(MetricTypeName::Gauge),
+            "set" => Ok(MetricTypeName::Set),
+            _ => Err(MetricError::BadTypeName(s.to_string())),
+        }
+    }
+}
+
+impl ToString for MetricTypeName {
+    fn to_string(&self) -> String {
+        match self {
+            MetricTypeName::Default => "default",
+            MetricTypeName::Counter => "counter",
+            MetricTypeName::DiffCounter => "diff-counter",
+            MetricTypeName::Timer => "timer",
+            MetricTypeName::Gauge => "gauge",
+            MetricTypeName::Set => "set",
+        }
+        .to_string()
     }
 }
 
