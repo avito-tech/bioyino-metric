@@ -1,34 +1,36 @@
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::fmt::Debug;
 
 use bytes::Bytes;
 use capnp;
 use capnp::message::{Allocator, Builder, HeapAllocator};
-use failure::Error;
-use failure_derive::Fail;
-use serde_derive::{Deserialize, Serialize};
+use num_traits::{AsPrimitive, Float};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::name::{find_tag_pos, MetricName, TagFormat};
 use crate::protocol_capnp::{gauge, metric as cmetric, metric_type};
 
-use num_traits::{AsPrimitive, Float};
-
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum MetricError {
-    #[fail(display = "float conversion")]
+    #[error("float conversion")]
     FloatToRatio,
 
-    #[fail(display = "bad sampling range")]
+    #[error("bad sampling range")]
     Sampling,
 
-    #[fail(display = "aggregating metrics of different types")]
+    #[error("aggregating metrics of different types")]
     Aggregating,
 
-    #[fail(display = "decoding error: {}", _0)]
+    #[error("decoding error: {}", _0)]
     Capnp(capnp::Error),
 
-    #[fail(display = "schema error: {}", _0)]
+    #[error("schema error: {}", _0)]
     CapnpSchema(capnp::NotInSchema),
+
+    #[error("unknown type name '{}'", _0)]
+    BadTypeName(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,7 +112,7 @@ where
     }
 
     /// Join self with a new incoming metric depending on type
-    pub fn accumulate(&mut self, new: Metric<F>) -> Result<(), Error> {
+    pub fn accumulate(&mut self, new: Metric<F>) -> Result<(), MetricError> {
         use self::MetricType::*;
         self.update_counter += new.update_counter;
         match (&mut self.mtype, new.mtype) {
@@ -153,7 +155,9 @@ where
     }
 
     pub fn from_capnp(reader: cmetric::Reader) -> Result<(MetricName, Metric<F>), MetricError> {
-        let name: Bytes = reader.get_name().map_err(MetricError::Capnp)?.into();
+        //let name: Bytes = reader.get_name().map_err(MetricError::Capnp)?.into();
+        let name: &[u8] = reader.get_name().map_err(MetricError::Capnp)?.as_bytes();
+        let name = Bytes::copy_from_slice(name);
         let tag_pos = find_tag_pos(&name[..], TagFormat::Graphite);
         let name = MetricName::from_raw_parts(name, tag_pos);
         let value: F = F::from_f64(reader.get_value());
@@ -286,6 +290,64 @@ where
             self.fill_capnp(&mut root);
         }
         builder
+    }
+}
+
+/// Metric type specification simplified to use for naming in configs etc
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "&str")]
+pub enum MetricTypeName {
+    Default,
+    Counter,
+    DiffCounter,
+    Timer,
+    Gauge,
+    Set,
+}
+
+impl MetricTypeName {
+    pub fn from_metric<F>(m: &Metric<F>) -> Self
+    where
+        F: Copy + PartialEq + Debug,
+    {
+        match m.mtype {
+            MetricType::Counter => MetricTypeName::Counter,
+            MetricType::DiffCounter(_) => MetricTypeName::DiffCounter,
+            MetricType::Timer(_) => MetricTypeName::Timer,
+            MetricType::Gauge(_) => MetricTypeName::Gauge,
+            MetricType::Set(_) => MetricTypeName::Set,
+        }
+    }
+}
+
+impl TryFrom<&str> for MetricTypeName {
+    type Error = MetricError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "default" => Ok(MetricTypeName::Default),
+            "counter" => Ok(MetricTypeName::Counter),
+            "diff-counter" => Ok(MetricTypeName::DiffCounter),
+            "timer" => Ok(MetricTypeName::Timer),
+            "gauge" => Ok(MetricTypeName::Gauge),
+            "set" => Ok(MetricTypeName::Set),
+            _ => Err(MetricError::BadTypeName(s.to_string())),
+        }
+    }
+}
+
+impl ToString for MetricTypeName {
+    fn to_string(&self) -> String {
+        match self {
+            MetricTypeName::Default => "default",
+            MetricTypeName::Counter => "counter",
+            MetricTypeName::DiffCounter => "diff-counter",
+            MetricTypeName::Timer => "timer",
+            MetricTypeName::Gauge => "gauge",
+            MetricTypeName::Set => "set",
+        }
+        .to_string()
     }
 }
 

@@ -4,42 +4,51 @@ use std::marker::PhantomData;
 use std::str::from_utf8;
 use std::str::FromStr;
 
-use combine::byte::{byte, bytes, digit, newline};
-use combine::combinator::{eof, skip_many};
 use combine::error::{ParseError, StreamError};
+use combine::parser::byte::{byte, bytes as parse_bytes, digit, newline};
 use combine::parser::range::{recognize, take, take_until_range, take_while1};
 use combine::stream::easy;
 use combine::stream::{decode, PointerOffset, RangeStream, StreamErrorFor};
 use combine::{choice, position};
+use combine::{eof, skip_many};
 use combine::{optional, skip_many1, Parser};
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 
 use crate::metric::{FromF64, Metric, MetricType};
 use crate::name::{sort_tags, MetricName, TagFormat};
 use num_traits::{AsPrimitive, Float};
 
 /// Used for returning parsing result
+/*
+#[derive(Debug)]
+pub enum ParsedPart<F, I>
+where
+F: Float + FromStr + Debug + AsPrimitive<f64>,
+{
+Metric((PointerOffset<I>, PointerOffset<I>), Option<PointerOffset<I>>, Metric<F>),
+Trash(PointerOffset<I>),
+TotalTrash(PointerOffset<I>),
+}
+*/
+
 #[derive(Debug)]
 pub enum ParsedPart<F>
 where
     F: Float + FromStr + Debug + AsPrimitive<f64>,
 {
-    Metric((PointerOffset, PointerOffset), Option<PointerOffset>, Metric<F>),
-    Trash(PointerOffset),
-    TotalTrash(PointerOffset),
+    Metric((PointerOffset<[u8]>, PointerOffset<[u8]>), Option<PointerOffset<[u8]>>, Metric<F>),
+    Trash(PointerOffset<[u8]>),
+    TotalTrash(PointerOffset<[u8]>),
 }
 
 // The current goal is to be fast, use less allocs and to not depend on error type. that's why
 // the signature may seem to be cryptic.
 /// Parse stream of multiple metrics in statsd format. Usage of MetricParser is recommended instead.
-pub fn metric_stream_parser<'a, I, F>(
-    max_unparsed: usize,
-    max_tags_len: usize,
-) -> impl Parser<Input = I, Output = ParsedPart<F>, PartialState = impl Default + 'a>
+pub fn metric_stream_parser<'a, I, F>(max_unparsed: usize, max_tags_len: usize) -> impl Parser<I, Output = ParsedPart<F>, PartialState = impl Default + 'a>
 where
-    I: RangeStream<Item = u8, Range = &'a [u8], Position = PointerOffset> + std::fmt::Debug,
-    I::Error: ParseError<I::Item, I::Range, I::Position>,
+    I: 'a + combine::StreamOnce<Token = u8, Range = &'a [u8], Position = PointerOffset<[u8]>> + std::fmt::Debug + RangeStream,
+    I::Error: ParseError<I::Token, I::Range, I::Position>,
     F: 'a + Float + Debug + FromStr + AsPrimitive<f64> + FromF64 + Sync,
     <F as FromStr>::Err: std::error::Error + Sync + Send + 'static,
 {
@@ -83,7 +92,7 @@ where
         });
 
     // This parses metric type
-    let mtype = bytes(b"ms")
+    let mtype = parse_bytes(b"ms")
         //
         .map(|_| MetricType::Timer(Vec::<F>::new()))
         .or(byte(b'g').map(|_| MetricType::Gauge(None)))
@@ -95,11 +104,11 @@ where
         //
         .and(optional((byte(b'.'), skip_many1(digit()))))
         .and(optional(
-            //
-            (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
+                //
+                (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
         ));
 
-    let sampling = (bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
+    let sampling = (parse_bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
         // TODO replace from_utf8 with handmade parser removing recognize
         from_utf8(val)
             .map_err(StreamErrorFor::<I>::other)
@@ -111,10 +120,10 @@ where
         val,
         mtype,
         choice((
-            sampling.map(Some),
-            skip_many(newline()).map(|_| None),
-            eof().map(|_| None),
-            //skip_many(newline()).map(|_| None),
+                sampling.map(Some),
+                skip_many(newline()).map(|_| None),
+                eof().map(|_| None),
+                //skip_many(newline()).map(|_| None),
         )),
     )
         .map(|(sign, mut val, mtype, sampling)| {
@@ -133,15 +142,15 @@ where
 
     // here's what we are trying to parse
     choice((
-        // valid metric with (probably) tags
-        (skip_many(newline()), name_with_tags, metric, skip_many(newline())).map(|(_, (start, tag, stop), m, _)| ParsedPart::Metric((start, stop), tag, m)),
-        (take_until_range(&b"\n"[..]), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::Trash(pos)),
-        // trash not ending with \n, but too long to be metric
-        (take(max_unparsed), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::TotalTrash(pos)),
+            // valid metric with (probably) tags
+            (skip_many(newline()), name_with_tags, metric, skip_many(newline())).map(|(_, (start, tag, stop), m, _)| ParsedPart::Metric((start, stop), tag, m)),
+            (take_until_range(&b"\n"[..]), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::Trash(pos)),
+            // trash not ending with \n, but too long to be metric
+            (take(max_unparsed), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::TotalTrash(pos)),
     ))
 }
 
-pub type MetricParsingError<'a> = easy::Errors<u8, &'a [u8], PointerOffset>;
+pub type MetricParsingError<'a> = easy::Errors<u8, &'a [u8], PointerOffset<[u8]>>;
 
 #[allow(unused_variables)]
 /// Used to handle parsing errors
@@ -206,7 +215,7 @@ where
                 //combine::stream::PartialStream(input),
                 //&mut Default::default(),
                 //            );
-                decode(parser, combine::easy::Stream(input), &mut Default::default())
+                decode(parser, &mut combine::easy::Stream(input), &mut Default::default())
             };
 
             match res {
@@ -315,7 +324,7 @@ where
                             Some(pos) => self.input.advance(pos),
                             None => self.input.clear(),
                         }
-                    //cut all the input otherwise
+                        //cut all the input otherwise
                     } else {
                         // cut buffer to position where error was found
                         self.skip = 0;
@@ -338,8 +347,13 @@ mod tests {
 
     struct TestParseErrorHandler;
     impl ParseErrorHandler for TestParseErrorHandler {
-        fn handle(&self, input: &[u8], pos: usize, e: MetricParsingError) {
-            println!("parse error at {:?} in {:?}: {:?}", pos, String::from_utf8_lossy(input), e);
+        fn handle(&self, input: &[u8], _: usize, e: MetricParsingError) {
+            println!(
+                "parse error at {:?} in {:?}: {:?}",
+                e.position.translate_position(input),
+                String::from_utf8_lossy(input),
+                e
+            );
         }
     }
 
@@ -440,8 +454,8 @@ mod tests {
         use bytes::BufMut;
         let mut data = BytesMut::from(&b"borets1"[..]);
         data.reserve(1000);
-        data.put(193u8);
-        data.put(129u8);
+        data.put_u8(193u8);
+        data.put_u8(129u8);
         data.put(&b":+1000|g\ngorets:-1000|g|@0.5"[..]);
         let mut parser = make_parser(&mut data);
         let r = parser.next();
@@ -454,13 +468,13 @@ mod tests {
 
     #[test]
     fn parse_metric_with_tags() {
-        let mut data = BytesMut::from(&b"gorets;a=b;c=d:+1000|g\ngorets:-1000|g|@0.5"[..]);
+        let mut data = BytesMut::from(&b"gorets;a=b.j.k.l;c=d:+1000|g\ngorets:-1000|g|@0.5"[..]);
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         // name is still full string, including tags
-        assert_eq!(&name.name[..], &b"gorets;a=b;c=d"[..]);
+        assert_eq!(&name.name[..], &b"gorets;a=b.j.k.l;c=d"[..]);
         assert_eq!(name.tag_pos, Some(6usize));
-        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";a=b;c=d"[..]);
+        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";a=b.j.k.l;c=d"[..]);
         assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, None).unwrap());
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
@@ -489,7 +503,7 @@ mod tests {
     #[test]
     fn parse_trashed_metric_with_tags() {
         let mut data = BytesMut::new();
-        data.extend_from_slice(b"trash\ngorets1:+1000|g\nTRASH\n\n\ngorets2;tag3=shit;t2=fuck:-1000|g|@0.5\nMORE;tra=sh;|TrasH\nFUUU");
+        data.extend_from_slice(b"trash\ngorets1:+1000|g\nTRASH\n\n\ngorets2;tag3=sh.t;t2=fuck:-1000|g|@0.5\nMORE;tra=sh;|TrasH\nFUUU");
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets1"[..]);
@@ -498,9 +512,9 @@ mod tests {
 
         // parser must sort tags
         let (name, metric) = parser.next().unwrap();
-        assert_eq!(&name.name[..], &b"gorets2;t2=fuck;tag3=shit"[..]);
+        assert_eq!(&name.name[..], &b"gorets2;t2=fuck;tag3=sh.t"[..]);
         assert_eq!(name.tag_pos, Some(7usize));
-        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";t2=fuck;tag3=shit"[..]);
+        assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";t2=fuck;tag3=sh.t"[..]);
         assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
     }
 
@@ -530,7 +544,7 @@ mod tests {
                 Bytes::from("gorets5"),
                 Metric::<f64>::new(1005f64, MetricType::Timer(Vec::new()), None, None).unwrap(),
             ),
-        ];
+            ];
         for i in 1..(data.len() + 1) {
             // this is out test case - partially received data
             let mut testinput = BytesMut::from(&data[0..i]);

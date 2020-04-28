@@ -4,10 +4,10 @@ use std::hash::{Hash, Hasher};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use num_traits::{AsPrimitive, Float};
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::aggregate::Aggregate;
-use crate::metric::FromF64;
+use crate::metric::{FromF64, MetricTypeName};
 
 // TODO: Think error type. There is single possible error atm, so sort_tags returns () instead
 // TODO: Think if we need sorted tags in btreemap instead of string (at the moment of writing this we don't, because of allocation)
@@ -93,8 +93,8 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
 pub struct MetricName {
     pub name: Bytes,
     pub(crate) tag_pos: Option<usize>,
-    //pub(crate) tag_format: TagFormat,  // TODO we mayn need this in future
-    //pub tags: BTreeMap<BytesMut, BytesMut>, // we need btreemap to have tags sorted
+    //pub(crate) tag_format: TagFormat,  // TODO we may need this in future
+    //pub tags: BTreeMap<BytesMut, BytesMut>, // we may need btreemap to have tags sorted
 }
 
 impl MetricName {
@@ -193,14 +193,14 @@ impl MetricName {
             None => {
                 buf.put_slice(&self.name);
                 if suflen > 0 {
-                    buf.put(b'.');
+                    buf.put_u8(b'.');
                     buf.put_slice(suffix);
                 }
             }
             Some(pos) => {
                 buf.put_slice(&self.name[..pos]);
                 if suflen > 0 {
-                    buf.put(b'.');
+                    buf.put_u8(b'.');
                     buf.put_slice(suffix);
                 }
                 if with_tags {
@@ -230,11 +230,14 @@ impl MetricName {
                 }
                 // easy case: no tags
                 if self.name[namelen - 1] != b';' {
-                    buf.put(b';');
+                    buf.put_u8(b';');
                 }
-                buf.put_slice(tag_name);
-                buf.put(b'=');
-                buf.put_slice(tag);
+
+                if !tag_name.is_empty() {
+                    buf.put_slice(tag_name);
+                    buf.put_u8(b'=');
+                    buf.put_slice(tag);
+                }
             }
             Some(pos) => {
                 // put the name itself anyways
@@ -264,21 +267,26 @@ impl MetricName {
 
                     // prepend new tag with semicolon if required
                     if self.name[namelen - 1] != b';' {
-                        buf.put(b';');
+                        buf.put_u8(b';');
                     }
 
                     // put new tag
-                    buf.put_slice(tag_name);
-                    buf.put(b'=');
-                    buf.put_slice(tag);
+                    if !tag_name.is_empty() {
+                        buf.put_slice(tag_name);
+                        buf.put_u8(b'=');
+                        buf.put_slice(tag);
+                    }
                 } else if offset == pos + 1 {
                     // new tag is put before all tags
 
                     // put the new tag with semicolon
-                    buf.put(b';');
-                    buf.put_slice(tag_name);
-                    buf.put(b'=');
-                    buf.put_slice(tag);
+                    //
+                    if !tag_name.is_empty() {
+                        buf.put_u8(b';');
+                        buf.put_slice(tag_name);
+                        buf.put_u8(b'=');
+                        buf.put_slice(tag);
+                    }
 
                     // put other tags with leading semicolon
                     buf.extend_from_slice(&self.name[pos..]);
@@ -287,14 +295,15 @@ impl MetricName {
                     buf.extend_from_slice(&self.name[pos..offset]);
 
                     // put the new tag
-                    buf.put_slice(tag_name);
-                    buf.put(b'=');
-                    buf.put_slice(tag);
+                    if !tag_name.is_empty() {
+                        buf.put_slice(tag_name);
+                        buf.put_u8(b'=');
+                        buf.put_slice(tag);
 
-                    if self.name[offset] != b';' {
-                        buf.put(b';');
+                        if self.name[offset] != b';' {
+                            buf.put_u8(b';');
+                        }
                     }
-
                     buf.extend_from_slice(&self.name[offset..]);
                 }
                 //
@@ -305,34 +314,11 @@ impl MetricName {
     /// Puts a name with an aggregate to provided buffer depending on dest.
     /// To avoid putting different aggregates into same names requires all replacements to exist, giving error otherwise.
     /// Does no do the check if such overriding is done.
-    #[allow(clippy::unit_arg)]
-    pub fn put_with_aggregate<F>(
-        // rustfmt
-        &self,
-        buf: &mut BytesMut,
-        dest: AggregationDestination,
-        agg: Aggregate<F>,
-        postfix_replacements: &HashMap<Aggregate<F>, String>,
-        prefix_replacements: &HashMap<Aggregate<F>, String>,
-        tag_replacements: &HashMap<Aggregate<F>, String>,
-    ) -> Result<(), ()>
-    where
-        F: Float + Debug + FromF64 + AsPrimitive<usize>,
-    {
-        // for value aggregate ignore replacements and other shit
-        if agg == Aggregate::Value {
-            let namelen = self.name.len();
-            buf.reserve(namelen);
-            buf.put_slice(&self.name);
-            return Ok(());
-        }
-
-        // find and put prefix first
-        let prefix = prefix_replacements.get(&agg).ok_or(())?;
+    pub fn put_full(&self, buf: &mut BytesMut, dest: AggregationDestination, postfix: &[u8], prefix: &[u8], tag: &[u8], tag_value: &[u8]) {
         if !prefix.is_empty() {
             buf.reserve(prefix.len() + 1);
-            buf.put(prefix);
-            buf.put(b'.');
+            buf.put_slice(prefix);
+            buf.put_u8(b'.');
         }
 
         // we should not use let agg_postfix before the match, because with the tag case we don't
@@ -341,37 +327,45 @@ impl MetricName {
 
         match dest {
             AggregationDestination::Smart if self.tag_pos.is_none() => {
-                let agg_postfix = postfix_replacements.get(&agg).ok_or(())?.as_bytes();
                 // metric is untagged, add aggregate to name
-                Ok(self.put_with_suffix(buf, agg_postfix, true))
+                self.put_with_suffix(buf, postfix, true)
             }
             AggregationDestination::Smart => {
-                let agg_tag_name = tag_replacements.get(&Aggregate::AggregateTag).ok_or(())?.as_bytes();
-                let agg_tag_value = tag_replacements.get(&agg).ok_or(())?.as_bytes();
-
                 // metric is tagged, add aggregate as tag
-                Ok(self.put_with_fixed_tag(buf, agg_tag_name, agg_tag_value, false))
+                self.put_with_fixed_tag(buf, tag, tag_value, false)
             }
-            AggregationDestination::Name => {
-                let agg_postfix = postfix_replacements.get(&agg).ok_or(())?.as_bytes();
-                Ok(self.put_with_suffix(buf, agg_postfix, true))
-            }
-            AggregationDestination::Tag => {
-                let agg_tag_name = tag_replacements.get(&Aggregate::AggregateTag).ok_or(())?.as_bytes();
-                let agg_tag_value = tag_replacements.get(&agg).ok_or(())?.as_bytes();
-
-                Ok(self.put_with_fixed_tag(buf, agg_tag_name, agg_tag_value, false))
-            }
+            AggregationDestination::Name => self.put_with_suffix(buf, postfix, true),
+            AggregationDestination::Tag => self.put_with_fixed_tag(buf, tag, tag_value, false),
             AggregationDestination::Both => {
-                let agg_postfix = postfix_replacements.get(&agg).ok_or(())?.as_bytes();
-                let agg_tag_name = tag_replacements.get(&Aggregate::AggregateTag).ok_or(())?.as_bytes();
-                let agg_tag_value = tag_replacements.get(&agg).ok_or(())?.as_bytes();
-
-                self.put_with_suffix(buf, agg_postfix, false);
-                self.put_with_fixed_tag(buf, agg_tag_name, agg_tag_value, true);
-                Ok(())
+                self.put_with_suffix(buf, postfix, false);
+                self.put_with_fixed_tag(buf, tag, tag_value, true)
             }
         }
+    }
+
+    /// Puts a name with an aggregate to provided buffer depending on dest.
+    /// To avoid putting different aggregates into same names requires all replacements to exist, giving error otherwise.
+    /// Does no do the check if such overriding is done.
+    /// Corner cases:
+    /// * does not put tag if tag name is empty, puts it if value is empty though
+    /// * does not consider (probably expected) defaults, like not putting postfix or tag_value for Aggregate::Value;
+    /// this beaviour must be exlpicitly specified in options with prefix = "" and/or tag_name = "".
+    #[allow(clippy::unit_arg)]
+    pub fn put_with_options<F>(
+        &self,
+        buf: &mut BytesMut,
+        name: MetricTypeName,
+        agg: Aggregate<F>,
+        options: &HashMap<(MetricTypeName, Aggregate<F>), NamingOptions>,
+    ) -> Result<(), ()>
+    where
+        F: Float + Debug + FromF64 + AsPrimitive<usize>,
+    {
+        let naming = options.get(&(name, agg)).ok_or(())?;
+
+        self.put_full(buf, naming.destination, &naming.postfix, &naming.prefix, &naming.tag, &naming.tag_value);
+
+        Ok(())
     }
 }
 
@@ -388,9 +382,29 @@ impl Hash for MetricName {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct NamingOptions {
+    /// global default prefix
+    pub prefix: Bytes,
+
+    /// the default tag name(i.e. key) to be used for aggregation
+    pub tag: Bytes,
+
+    /// replacements for aggregate tag values, naming is <tag>=<tag_value>
+    pub tag_value: Bytes,
+
+    /// names for aggregate postfixes
+    pub postfix: Bytes,
+
+    /// Where to put aggregate postfix
+    pub destination: AggregationDestination,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregate::possible_aggregates;
 
     fn new_name_graphite(n: &[u8]) -> MetricName {
         let mut buf = Vec::with_capacity(9000);
@@ -398,8 +412,18 @@ mod tests {
         MetricName::new(BytesMut::from(n), TagFormat::Graphite, &mut buf).unwrap()
     }
 
+    pub fn default_options(s: &[u8]) -> NamingOptions {
+        NamingOptions {
+            prefix: Bytes::new(),
+            tag: Bytes::copy_from_slice(b"aggregate"),
+            tag_value: Bytes::copy_from_slice(s),
+            postfix: Bytes::copy_from_slice(s),
+            destination: AggregationDestination::Smart,
+        }
+    }
+
     fn assert_buf(buf: &mut BytesMut, match_: &[u8], error: &'static str) {
-        let res = &buf.take()[..];
+        let res = &buf.split()[..];
         assert_eq!(
             res,
             match_,
@@ -440,23 +464,20 @@ mod tests {
     fn metric_name_put_tag() {
         let with_tags = new_name_graphite(&b"gorets.bobez;aa=v;aa=z;bb=z;dd=h;"[..]);
 
+        let typename = MetricTypeName::Timer;
+
         // create some replacements
-        let mut po_reps: HashMap<Aggregate<f64>, String> = HashMap::new();
-        po_reps.insert(Aggregate::Count, "count".to_string());
-
-        let mut pr_reps: HashMap<Aggregate<f64>, String> = HashMap::new();
-        pr_reps.insert(Aggregate::Count, String::new());
-
-        let mut t_reps: HashMap<Aggregate<f64>, String> = HashMap::new();
-        t_reps.insert(Aggregate::Count, "count".to_string());
+        let mut opts: HashMap<(MetricTypeName, Aggregate<f64>), NamingOptions> = HashMap::new();
+        let nopts = default_options(b"count");
+        let key = (MetricTypeName::Timer, Aggregate::Count);
+        opts.insert(key, nopts);
 
         let mut buf = BytesMut::new();
 
-        t_reps.insert(Aggregate::AggregateTag, "aa".to_string());
+        opts.get_mut(&key).unwrap().destination = AggregationDestination::Tag;
+        opts.get_mut(&key).unwrap().tag = Bytes::from_static(b"aa");
 
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Tag, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts).unwrap();
 
         assert_buf(
             &mut buf,
@@ -464,11 +485,8 @@ mod tests {
             "aggregate properly added in front of tags",
         );
 
-        dbg!("WTF??", &with_tags.name);
-        t_reps.insert(Aggregate::AggregateTag, "cc".to_string());
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Tag, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
+        opts.get_mut(&key).unwrap().tag = Bytes::from_static(b"cc");
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts).unwrap();
 
         assert_buf(
             &mut buf,
@@ -476,10 +494,8 @@ mod tests {
             "aggregate properly added in middle of tags",
         );
 
-        t_reps.insert(Aggregate::AggregateTag, "ff".to_string());
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Tag, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
+        opts.get_mut(&key).unwrap().tag = Bytes::from_static(b"ff");
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts).unwrap();
 
         assert_buf(
             &mut buf,
@@ -489,208 +505,232 @@ mod tests {
     }
 
     #[test]
+    fn metric_naming_aggregates() {
+        let all_aggs = possible_aggregates();
+        let mut intermediate: Vec<u8> = Vec::new();
+        intermediate.resize(256, 0u8);
+
+        let name = MetricName::new(BytesMut::from("gorets.bobez;tag2=val2;tag1=value1"), TagFormat::Graphite, &mut intermediate).unwrap();
+
+        // create naming options for all of the aggs
+        let mut opts: HashMap<(MetricTypeName, Aggregate<f64>), NamingOptions> = HashMap::new();
+        for (ty, aggs) in &all_aggs {
+            for agg in aggs {
+                opts.insert(
+                    (ty.clone(), agg.clone()),
+                    // for testing purposes we:
+                    // * make the min aggregate have no tag and no postfix emulating value aggregate
+                    // * make the max aggregate have no tag but still have postfix
+                    // * use the default value aggregate setting where the postfix is empty but tag exists having empty tag_value
+                    NamingOptions {
+                        prefix: Bytes::copy_from_slice(b"prefix"),
+                        tag: if agg == &Aggregate::Max || agg == &Aggregate::Min {
+                            // for testing purposes put the empty tag name for max aggregate
+                            Bytes::new()
+                        } else {
+                            Bytes::copy_from_slice(b"aggtag")
+                        },
+                        tag_value: Bytes::copy_from_slice(agg.to_string().as_bytes()),
+                        postfix: if agg == &Aggregate::Min {
+                            // for testing purposes put the empty tag name for max aggregate
+                            Bytes::new()
+                        } else {
+                            Bytes::copy_from_slice(agg.to_string().as_bytes())
+                        },
+                        destination: AggregationDestination::Both, // we can check both destination at once
+                    },
+                );
+            }
+        }
+
+        for (ty, aggs) in all_aggs {
+            for agg in aggs {
+                let mut buf = BytesMut::new();
+                let inagg = agg.to_string();
+                // we obviously do not use format! in production code, but the behaviour is like here
+                let expected = if let Aggregate::Value = agg {
+                    // value aggregate has empty postfix, so no dot should be put at the end of the name
+                    Bytes::copy_from_slice(format!("prefix.gorets.bobez;aggtag={agg};tag1=value1;tag2=val2", agg = &inagg).as_bytes())
+                } else if let Aggregate::Max = agg {
+                    // max aggregate has empty tag name, so no tag should be put
+                    Bytes::copy_from_slice(format!("prefix.gorets.bobez.{agg};tag1=value1;tag2=val2", agg = &inagg).as_bytes())
+                } else if let Aggregate::Min = agg {
+                    // min aggregate has no tag and no postfix, so it should ne like metric, but
+                    // with sorted tags
+                    Bytes::copy_from_slice(b"prefix.gorets.bobez;tag1=value1;tag2=val2")
+                } else if let Aggregate::Percentile(_, _) = agg {
+                    // this is separated to check percentile naming
+                    Bytes::copy_from_slice(b"prefix.gorets.bobez.percentile.99;aggtag=percentile.99;tag1=value1;tag2=val2")
+                } else {
+                    Bytes::copy_from_slice(format!("prefix.gorets.bobez.{agg};aggtag={agg};tag1=value1;tag2=val2", agg = &inagg).as_bytes())
+                };
+                name.put_with_options(&mut buf, ty, agg, &opts).expect("putting name failed");
+                //dbg!(&ty, &expected, &buf);
+                assert_eq!(expected, buf);
+            }
+        }
+    }
+
+    #[test]
     fn metric_aggregate_modes() {
+        let typename = MetricTypeName::Timer;
+
         // create some replacements
-        let mut po_reps: HashMap<Aggregate<f64>, String> = HashMap::new();
-        po_reps.insert(Aggregate::Count, "count".to_string());
-        po_reps.insert(Aggregate::AggregateTag, "MUST NOT BE USED".to_string());
-        po_reps.insert(Aggregate::Percentile(0.8f64), "percentile80".to_string());
-        po_reps.insert(Aggregate::UpdateCount, "".to_string());
+        // for count replace prefix and tag value
+        let mut opts: HashMap<(MetricTypeName, Aggregate<f64>), NamingOptions> = HashMap::new();
+        let mut nopts = default_options(b"count");
+        nopts.prefix = Bytes::from_static(b"counts");
+        nopts.tag = Bytes::from_static(b"agg");
+        nopts.tag_value = Bytes::from_static(b"cnt");
+        let timer = MetricTypeName::Timer;
+        opts.insert((timer, Aggregate::Count), nopts);
 
-        let mut pr_reps: HashMap<Aggregate<f64>, String> = HashMap::new();
-        pr_reps.insert(Aggregate::Count, "counts".to_string());
-        pr_reps.insert(Aggregate::UpdateCount, "updates".to_string());
-        pr_reps.insert(Aggregate::Percentile(0.8f64), "".to_string());
+        // for percentile80 replace prefix with empty value
+        let mut nopts = default_options(b"percentile80");
+        nopts.prefix = Bytes::new();
+        opts.insert((timer, Aggregate::Percentile(0.8f64, 80)), nopts);
 
-        let mut t_reps: HashMap<Aggregate<f64>, String> = HashMap::new();
-        t_reps.insert(Aggregate::Count, "cnt".to_string());
-        t_reps.insert(Aggregate::UpdateCount, "updates".to_string());
-        t_reps.insert(Aggregate::AggregateTag, "agg".to_string());
-        // intentionally skip adding percentile80
+        // for update count  replace prefix and tag name
+        let mut nopts = default_options(b"updates");
+        nopts.postfix = Bytes::from_static(b"");
+        nopts.prefix = Bytes::from_static(b"updates");
+        nopts.tag = Bytes::from_static(b"agg");
 
-        let without_tags = new_name_graphite(&b"gorets.bobez"[..]);
-        let with_tags = new_name_graphite(&b"gorets.bobez;tag=value"[..]);
-        let with_semicolon = new_name_graphite(&b"gorets.bobez;"[..]);
+        opts.insert((timer, Aggregate::UpdateCount), nopts);
+
+        let without_tags = new_name_graphite(b"gorets.bobez");
+        let with_tags = new_name_graphite(b"gorets.bobez;tag=value");
+        let with_semicolon = new_name_graphite(b"gorets.bobez;");
+
+        // create the same options but with name mode aggregation
+        let mut opts_mode_name = opts.clone();
+        for (_, v) in &mut opts_mode_name {
+            v.destination = AggregationDestination::Name;
+        }
+        // create the same options but with tag mode aggregation
+        let mut opts_mode_tag = opts.clone();
+        for (_, v) in &mut opts_mode_tag {
+            v.destination = AggregationDestination::Tag;
+        }
+
+        // create the same options but with both mode aggregation
+        let mut opts_mode_both = opts.clone();
+        for (_, v) in &mut opts_mode_both {
+            v.destination = AggregationDestination::Both;
+        }
 
         // create 0-size buffer to make sure allocation counts work as intended
         let mut buf = BytesMut::new();
 
-        // --------- without_tags
+        // --------- without_tags, smart mode
 
         // max is not in replacements
         assert!(
-            without_tags
-                .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Max, &po_reps, &pr_reps, &t_reps)
-                .is_err(),
+            without_tags.put_with_options(&mut buf, typename, Aggregate::Max, &opts).is_err(),
             "non existing replacement gave no error"
         );
 
-        // value is aggregated withtout replacements
-        without_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Value, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez"[..]);
+        without_tags.put_with_options(&mut buf, typename, Aggregate::UpdateCount, &opts).unwrap();
+        assert_eq!(
+            &buf.split()[..],
+            &b"updates.gorets.bobez"[..],
+            "update count should be aggregated only with prefix"
+        );
 
-        // update count is aggregated only with prefix
-        without_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::UpdateCount, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-
-        assert_eq!(&buf.take()[..], &b"updates.gorets.bobez"[..]);
-
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::UpdateCount, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-
+        with_tags.put_with_options(&mut buf, typename, Aggregate::UpdateCount, &opts).unwrap();
         assert_buf(
             &mut buf,
             &b"updates.gorets.bobez;agg=updates;tag=value"[..],
-            "add aggregate to tagged metric in smart mode",
+            "aggregate is added to tagged metric in smart mode",
         );
 
-        // different aggregation modes work as intended
-        without_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez.count"[..]);
-
-        without_tags
-            .put_with_aggregate(
-                &mut buf,
-                AggregationDestination::Smart,
-                Aggregate::Percentile(0.8f64),
-                &po_reps,
-                &pr_reps,
-                &t_reps,
-            )
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
-
-        without_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Name, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez.count"[..]);
-
-        without_tags
-            .put_with_aggregate(
-                &mut buf,
-                AggregationDestination::Name,
-                Aggregate::Percentile(0.8f64),
-                &po_reps,
-                &pr_reps,
-                &t_reps,
-            )
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
-
-        without_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Tag, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez;agg=cnt"[..]);
-
-        let err = without_tags.put_with_aggregate(
+        without_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts).unwrap();
+        assert_buf(
             &mut buf,
-            AggregationDestination::Tag,
-            Aggregate::Percentile(0.8f64),
-            &po_reps,
-            &pr_reps,
-            &t_reps,
+            &b"counts.gorets.bobez.count"[..],
+            "postfix and prefix are placed properly in smart mode",
         );
-        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
 
         without_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Both, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
+            .put_with_options(&mut buf, typename, Aggregate::Percentile(0.8f64, 80), &opts)
             .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez.count;agg=cnt"[..]);
+        assert_buf(&mut buf, &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
 
-        let err = without_tags.put_with_aggregate(
-            &mut buf,
-            AggregationDestination::Both,
-            Aggregate::Percentile(0.8f64),
-            &po_reps,
-            &pr_reps,
-            &t_reps,
-        );
-        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
+        without_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts_mode_name).unwrap();
+        assert_buf(&mut buf, &b"counts.gorets.bobez.count"[..], "name aggregation works properly");
+
+        without_tags
+            .put_with_options(&mut buf, typename, Aggregate::Percentile(0.8f64, 80), &opts_mode_name)
+            .unwrap();
+
+        // checks aggregate hashing
+        assert_buf(&mut buf, &b"gorets.bobez.percentile80"[..], "existing postfix replacement was not put");
+
+        without_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts_mode_tag).unwrap();
+        assert_buf(&mut buf, &b"counts.gorets.bobez;agg=cnt"[..], "tag aggregated properly");
+
+        without_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts_mode_both).unwrap();
+        assert_buf(&mut buf, &b"counts.gorets.bobez.count;agg=cnt"[..], "both mode aggregations works properly");
 
         // --------- with_tags
-        assert!(with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Max, &po_reps, &pr_reps, &t_reps)
-            .is_err());
+        assert!(with_tags.put_with_options(&mut buf, typename, Aggregate::Max, &opts).is_err());
 
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Value, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez;tag=value"[..]);
-
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez;agg=cnt;tag=value"[..]);
-
-        let err = with_tags.put_with_aggregate(
+        let mut mopts = opts.clone();
+        let mut nopts = default_options(b"");
+        nopts.tag = Bytes::from_static(b"");
+        mopts.insert((timer, Aggregate::Value), nopts);
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Value, &mopts).unwrap();
+        assert_buf(
             &mut buf,
-            AggregationDestination::Smart,
-            Aggregate::Percentile(0.8f64),
-            &po_reps,
-            &pr_reps,
-            &t_reps,
+            &b"gorets.bobez;tag=value"[..],
+            "tag is properly ignored for value aggregate in smart mode",
         );
-        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
 
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Name, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
+        let mut mopts = opts.clone();
+        let mut nopts = default_options(b"");
+        nopts.tag = Bytes::from_static(b"agg");
+        nopts.tag_value = Bytes::from_static(b"");
+        mopts.insert((timer, Aggregate::Value), nopts);
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Value, &mopts).unwrap();
+        assert_buf(
+            &mut buf,
+            &b"gorets.bobez;agg=;tag=value"[..],
+            "tag with empty value is properly added in smart mode",
+        );
+
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts).unwrap();
+        assert_buf(
+            &mut buf,
+            &b"counts.gorets.bobez;agg=cnt;tag=value"[..],
+            "tag is at proper sorted place in smart mode",
+        );
+
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts_mode_name).unwrap();
         assert_buf(&mut buf, &b"counts.gorets.bobez.count;tag=value"[..], "put tagged metric in name mode");
 
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Tag, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts_mode_tag).unwrap();
         assert_buf(
             &mut buf,
             &b"counts.gorets.bobez;agg=cnt;tag=value"[..],
             "add aggregate to tagged metric in tag mode",
         );
 
-        let err = with_tags.put_with_aggregate(
-            &mut buf,
-            AggregationDestination::Tag,
-            Aggregate::Percentile(0.8f64),
-            &po_reps,
-            &pr_reps,
-            &t_reps,
-        );
-        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
-
-        with_tags
-            .put_with_aggregate(&mut buf, AggregationDestination::Both, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
+        with_tags.put_with_options(&mut buf, typename, Aggregate::Count, &opts_mode_both).unwrap();
         assert_buf(
             &mut buf,
             &b"counts.gorets.bobez.count;agg=cnt;tag=value"[..],
             "add aggregate to tagged metric in both mode",
         );
 
-        let err = with_tags.put_with_aggregate(
-            &mut buf,
-            AggregationDestination::Both,
-            Aggregate::Percentile(0.8f64),
-            &po_reps,
-            &pr_reps,
-            &t_reps,
-        );
-        assert_eq!(err, Err(()), "p80 aggregated into tags whilt it should not");
+        let mut mopts = opts.clone();
+        let mut nopts = default_options(b"");
+        nopts.tag = Bytes::new();
+        mopts.insert((timer, Aggregate::Value), nopts);
+        with_semicolon.put_with_options(&mut buf, typename, Aggregate::Value, &mopts).unwrap();
+        assert_buf(&mut buf, &b"gorets.bobez;"[..], "trailing semicolon is not duplicated");
 
-        // ensure trailing semicolon is not duplicated
-        with_semicolon
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Value, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"gorets.bobez;"[..]);
-
-        with_semicolon
-            .put_with_aggregate(&mut buf, AggregationDestination::Smart, Aggregate::Count, &po_reps, &pr_reps, &t_reps)
-            .unwrap();
-        assert_eq!(&buf.take()[..], &b"counts.gorets.bobez;agg=cnt"[..]);
+        with_semicolon.put_with_options(&mut buf, typename, Aggregate::Count, &opts).unwrap();
+        assert_buf(&mut buf, &b"counts.gorets.bobez;agg=cnt"[..], "semicolon is added properly");
     }
 
     #[test]
