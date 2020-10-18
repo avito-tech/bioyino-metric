@@ -368,6 +368,27 @@ mod tests {
     }
 
     #[test]
+    fn aggregating_with_sampling() {
+        // aggregate with sampling
+        let samples = vec![12f64, 43f64, 1f64, 9f64, 84f64, 55f64, 31f64, 16f64, 64f64];
+        // counter value is 1 after sampling considered
+        let mut counter = Metric::new(0.01f64, MetricType::Counter, None, Some(0.01)).unwrap();
+        samples
+            .iter()
+            .map(|t| {
+                let counter2 = Metric::new(*t, MetricType::Counter, None, None).unwrap();
+                counter.accumulate(counter2).unwrap();
+            })
+            .last();
+
+        let expected = 316f64; // sum of samples + 1, 1 goes from the counter value itself
+
+        //  there is a small precision loss due to float converions and sampling calculations
+        //  so the resulting value will be close but not equal to expected one
+        assert!((counter.value - expected).abs() < 0.0001, format!("{} ~= {}", counter.value, expected));
+    }
+
+    #[test]
     fn aggregating_with_iterator() {
         // create aggregates list
         // this also tests all aggregates are parsed
@@ -423,11 +444,11 @@ mod tests {
 
         // diff counter is when you send a counter value as is, but it's considered increasing and
         // only positive diff adds up
-        let mut dcounter = Metric::new(1f64, MetricType::DiffCounter(0.0), None, Some(0.1)).unwrap();
+        let mut dcounter = Metric::new(1f64, MetricType::DiffCounter(0.0), None, None).unwrap();
         samples
             .iter()
             .map(|t| {
-                let dcounter2 = Metric::new(*t, MetricType::DiffCounter(0.0), None, Some(0.1)).unwrap();
+                let dcounter2 = Metric::new(*t, MetricType::DiffCounter(0.0), None, None).unwrap();
                 dcounter.accumulate(dcounter2).unwrap();
             })
             .last();
@@ -515,7 +536,7 @@ mod tests {
                     })
                     .last();
             } else {
-                assert_eq!(ev, rv);
+                assert_eq!(ev, rv, "\non {:?}: \n {:?} \n not equal to \n {:?}", &ec, &ev, &rv);
             }
         }
     }
