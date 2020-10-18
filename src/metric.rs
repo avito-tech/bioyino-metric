@@ -56,7 +56,7 @@ where
     pub mtype: MetricType<F>,
     pub timestamp: Option<u64>,
     pub update_counter: u32,
-    pub sampling: Option<f32>,
+    //pub sampling: Option<f32>,
 }
 
 pub trait FromF64 {
@@ -94,11 +94,17 @@ where
     F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
 {
     pub fn new(value: F, mtype: MetricType<F>, timestamp: Option<u64>, sampling: Option<f32>) -> Result<Self, MetricError> {
+        // consider sampling
+        let value = if let Some(sampling) = sampling {
+            value / F::from_f64(sampling as f64)
+        } else {
+            value
+        };
+
         let mut metric = Metric {
             value,
             mtype,
             timestamp,
-            sampling,
             update_counter: 1,
         };
 
@@ -108,6 +114,7 @@ where
         if let MetricType::Set(ref mut hs) = metric.mtype {
             hs.insert(metric.value.as_().to_bits());
         };
+
         Ok(metric)
     }
 
@@ -205,13 +212,18 @@ where
             Err(_) => (None, None),
         };
 
+        // consider sampling by hand
+        let value = if let Some(sampling) = sampling {
+            value / F::from_f64(sampling as f64)
+        } else {
+            value
+        };
         // we should NOT use Metric::new here because it is not a newly created metric
         // we'd get duplicate value in timer/set metrics if we used new
         let metric: Metric<F> = Metric {
             value,
             mtype,
             timestamp,
-            sampling,
             update_counter: if let Some(c) = up_counter { c } else { 1 },
         };
 
@@ -266,9 +278,11 @@ where
 
         // meta
         let mut m_builder = builder.reborrow().init_meta();
-        if let Some(sampling) = self.sampling {
-            m_builder.reborrow().init_sampling().set_sampling(sampling)
-        }
+
+        // NOTE: We do not set the sampling, because we don't have it stored
+        // converting it at input instead.
+        // We, ourselves don't sample any metrics
+
         m_builder.set_update_counter(self.update_counter);
     }
 

@@ -19,7 +19,7 @@ use crate::metric::{FromF64, Metric, MetricType};
 use crate::name::{sort_tags, MetricName, TagFormat};
 use num_traits::{AsPrimitive, Float};
 
-/// Used for returning parsing result
+// (was) used for returning parsing result
 /*
 #[derive(Debug)]
 pub enum ParsedPart<F, I>
@@ -104,8 +104,8 @@ where
         //
         .and(optional((byte(b'.'), skip_many1(digit()))))
         .and(optional(
-                //
-                (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
+            //
+            (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
         ));
 
     let sampling = (parse_bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
@@ -120,10 +120,10 @@ where
         val,
         mtype,
         choice((
-                sampling.map(Some),
-                skip_many(newline()).map(|_| None),
-                eof().map(|_| None),
-                //skip_many(newline()).map(|_| None),
+            sampling.map(Some),
+            skip_many(newline()).map(|_| None),
+            eof().map(|_| None),
+            //skip_many(newline()).map(|_| None),
         )),
     )
         .map(|(sign, mut val, mtype, sampling)| {
@@ -142,11 +142,11 @@ where
 
     // here's what we are trying to parse
     choice((
-            // valid metric with (probably) tags
-            (skip_many(newline()), name_with_tags, metric, skip_many(newline())).map(|(_, (start, tag, stop), m, _)| ParsedPart::Metric((start, stop), tag, m)),
-            (take_until_range(&b"\n"[..]), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::Trash(pos)),
-            // trash not ending with \n, but too long to be metric
-            (take(max_unparsed), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::TotalTrash(pos)),
+        // valid metric with (probably) tags
+        (skip_many(newline()), name_with_tags, metric, skip_many(newline())).map(|(_, (start, tag, stop), m, _)| ParsedPart::Metric((start, stop), tag, m)),
+        (take_until_range(&b"\n"[..]), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::Trash(pos)),
+        // trash not ending with \n, but too long to be metric
+        (take(max_unparsed), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::TotalTrash(pos)),
     ))
 }
 
@@ -324,7 +324,7 @@ where
                             Some(pos) => self.input.advance(pos),
                             None => self.input.clear(),
                         }
-                        //cut all the input otherwise
+                    //cut all the input otherwise
                     } else {
                         // cut buffer to position where error was found
                         self.skip = 0;
@@ -544,7 +544,7 @@ mod tests {
                 Bytes::from("gorets5"),
                 Metric::<f64>::new(1005f64, MetricType::Timer(Vec::new()), None, None).unwrap(),
             ),
-            ];
+        ];
         for i in 1..(data.len() + 1) {
             // this is out test case - partially received data
             let mut testinput = BytesMut::from(&data[0..i]);
