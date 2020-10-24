@@ -68,8 +68,11 @@ where
     Median,
     Mean,
     UpdateCount,
+    /// A number of updates per second, must be in seconds
+    /// NOTE: aggretate value may not be set out of the box, i.e. when converted from string
+    Rate(Option<F>),
     // user will want the exact same number formatting of percentile like in config, but
-    // float converstions from/to string may loose it, so
+    // float converstions from/to string may lose it, so
     // we prefer to keep the percentile as is, with the original integer parsed from config value
     // this is also VERY useful when comparing and hashing percentiles too
     // the only one downside is that i.e. 0.8th and 0.800 th percentile will be different metrics,
@@ -94,6 +97,7 @@ where
             "median" => Ok(Aggregate::Median),
             "mean" => Ok(Aggregate::Mean),
             "updates" => Ok(Aggregate::UpdateCount),
+            "rate" => Ok(Aggregate::Rate(None)),
             s if s.starts_with("percentile-") => {
                 // check in match guarantees minus char exists
                 let pos = s.chars().position(|c| c == '-').unwrap() + 1;
@@ -129,6 +133,7 @@ where
             Aggregate::Median => "median".to_string(),
             Aggregate::Mean => "mean".to_string(),
             Aggregate::UpdateCount => "updates".to_string(),
+            Aggregate::Rate(_) => "rate".to_string(),
             Aggregate::Percentile(p, _) if !p.is_finite() => "bad_percentile".to_string(),
             Aggregate::Percentile(_, num) => format!("percentile.{}", num),
         }
@@ -150,6 +155,11 @@ where
             Aggregate::Median => 6usize.hash(state),
             Aggregate::Mean => 7usize.hash(state),
             Aggregate::UpdateCount => 8usize.hash(state),
+            Aggregate::Rate(ref r) => {
+                9usize.hash(state);
+                // we hash F as integer decoded value
+                r.map(|f| Float::integer_decode(f)).hash(state);
+            }
             // we need this for hashing and comparison, so we just use a value different from other
             // enum values
             // the second thing we need here is correctness, so nobody could send us some strange
@@ -183,6 +193,7 @@ where
             (Aggregate::Median, Aggregate::Median) => true,
             (Aggregate::Mean, Aggregate::Mean) => true,
             (Aggregate::UpdateCount, Aggregate::UpdateCount) => true,
+            (Aggregate::Rate(r1), Aggregate::Rate(r2)) => r1 == r2,
             // we need this for hashing and comparison, so we just use a value different from other
             // percentile value like inf or nan (maybe there will be no such case, but just for the
             // sake of correctness we'd better do this
@@ -197,7 +208,7 @@ where
     F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
     /// calculates the corresponding aggregate from the input metric
-    /// returne None in all inapplicable cases, like zero-length vector or metric type mismatch
+    /// returns None in all inapplicable cases, like zero-length vector or metric type mismatch
     /// cached_sum must relate to the same metric between calls, giving incorrect results or
     /// panics otherwise
     pub fn calculate(&self, metric: &Metric<F>, cached_sum: &mut Option<F>) -> Option<F> {
@@ -208,7 +219,7 @@ where
             (MetricType::Set(_), &Aggregate::Value) => None,
             (MetricType::Timer(_), &Aggregate::Value) => None,
             // for timers calculate all aggregates
-            (MetricType::Timer(ref agg), s) => match s {
+            (MetricType::Timer(ref agg), &s) => match s {
                 Aggregate::Value => None,
                 Aggregate::Count => Some(F::from_f64(agg.len() as f64)),
                 Aggregate::Last => agg.last().copied(),
@@ -229,12 +240,15 @@ where
                     })
                 }
                 Aggregate::UpdateCount => Some(F::from_f64(f64::from(metric.update_counter))),
+                Aggregate::Rate(Some(r)) => Some(F::from_f64(f64::from(metric.update_counter)) / r),
+                Aggregate::Rate(None) => None,
                 Aggregate::Percentile(ref p, _) => Some(percentile(agg, *p)),
             },
             // cout value for all types except timers (matched above)
             (_, &Aggregate::Value) => Some(metric.value),
             // for other types calculate only update counter
             (_, &Aggregate::UpdateCount) => Some(F::from_f64(f64::from(metric.update_counter))),
+            (_, &Aggregate::Rate(Some(r))) => Some(F::from_f64(f64::from(metric.update_counter)) / r),
             _ => None,
         }
     }
@@ -294,7 +308,8 @@ where
 
 /// A helper function giving all possible aggregates for each metric type name.
 /// Includes ony one, 99th percentile for the sake of complenetes
-pub fn possible_aggregates<F>() -> HashMap<MetricTypeName, Vec<Aggregate<F>>>
+/// `interval` paremeter is only used to set the rate aggregation interval
+pub fn possible_aggregates<F>(interval: Option<F>) -> HashMap<MetricTypeName, Vec<Aggregate<F>>>
 where
     F: Float + Debug + FromF64 + AsPrimitive<usize>,
 {
@@ -313,6 +328,7 @@ where
             Aggregate::Median,
             Aggregate::Mean,
             Aggregate::UpdateCount,
+            Aggregate::Rate(interval),
             Aggregate::Percentile(F::from_f64(0.99), 99),
         ],
     );
@@ -390,9 +406,12 @@ mod tests {
 
     #[test]
     fn aggregating_with_iterator() {
-        // create aggregates list
-        // this also tests all aggregates are parsed
-        let aggregates = vec!["count", "min", "updates", "max", "sum", "median", "percentile-85"];
+        // NOTE: when modifying this test, push expected aggregates to `expected` value's vector
+        // in the same order as in `aggregates` vector
+        // (this is needed for equality test to work as intended)
+
+        // create aggregates list, this also tests all aggregates are parsed
+        let aggregates = vec!["count", "min", "updates", "max", "sum", "median", "rate", "percentile-85"];
         let mut aggregates = aggregates
             .into_iter()
             .map(|s| Aggregate::try_from(s.to_string()).unwrap())
@@ -400,13 +419,28 @@ mod tests {
         // add hidden value aggregator
         aggregates.push(Aggregate::Value);
 
-        let samples = vec![12f64, 43f64, 1f64, 9f64, 84f64, 55f64, 31f64, 16f64, 64f64];
-        let mut expected = HashMap::new();
+        let seconds = 2.5f64;
 
-        let mut metrics = Vec::new();
+        // 6th element must be rate
+        // which we explicitly set to aggregation_interval value because we cannot get it from
+        // just string parsing
+        if let &mut Aggregate::Rate(ref mut r @ None) = &mut aggregates[6] {
+            *r = Some(seconds)
+        } else {
+            panic!("6th element must be rate, got {:?}", aggregates[6]);
+        }
+
+        let samples = vec![12f64, 43f64, 1f64, 9f64, 84f64, 55f64, 31f64, 16f64, 64f64];
+
+        let mut expected: HashMap<Aggregate<f64>, Vec<(Metric<f64>, f64)>> = HashMap::new();
+
+        let mut to_aggregate = Vec::new();
+
+        // fill the keys to easier modifying them later
         aggregates.iter().map(|agg| expected.insert(agg.clone(), Vec::new())).last();
-        // NOTE: when modifying this test, push expected aggregates to vector in the same order as `aggregates` vector
-        // (this is needed for equality test to work as intended)
+
+        let rate_aggregate = Aggregate::Rate(Some(seconds));
+        let num_samples = samples.len() as f64;
 
         // TODO: gauge signs
         let mut gauge = Metric::new(1f64, MetricType::Gauge(None), None, None).unwrap();
@@ -418,13 +452,14 @@ mod tests {
             })
             .last();
 
-        metrics.push(gauge.clone());
+        to_aggregate.push(gauge.clone());
 
-        // gauges only consider last value
+        // gauges only consider last value, but default aggregates still exist
         expected.get_mut(&Aggregate::Value).unwrap().push((gauge.clone(), 64f64));
-        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((gauge.clone(), 10f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((gauge.clone(), num_samples + 1f64));
+        expected.get_mut(&rate_aggregate).unwrap().push((gauge.clone(), (num_samples + 1f64) / seconds));
 
-        // counters must be aggregated into two aggregates: value and update counter
+        // counters must be aggregated into 3 aggregates: value, update counter and rate
         let mut counter = Metric::new(1f64, MetricType::Counter, None, None).unwrap();
         let mut sign = 1f64;
         samples
@@ -436,11 +471,15 @@ mod tests {
             })
             .last();
 
-        metrics.push(counter.clone());
+        to_aggregate.push(counter.clone());
 
         // aggregated value for counter is a sum of all incoming data considering signs
         expected.get_mut(&Aggregate::Value).unwrap().push((counter.clone(), -68f64));
-        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((counter.clone(), 10f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((counter.clone(), num_samples + 1f64));
+        expected
+            .get_mut(&rate_aggregate)
+            .unwrap()
+            .push((counter.clone(), (num_samples + 1f64) / seconds));
 
         // diff counter is when you send a counter value as is, but it's considered increasing and
         // only positive diff adds up
@@ -453,10 +492,14 @@ mod tests {
             })
             .last();
 
-        metrics.push(dcounter.clone());
+        to_aggregate.push(dcounter.clone());
 
         expected.get_mut(&Aggregate::Value).unwrap().push((dcounter.clone(), 278f64));
-        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((dcounter.clone(), 10f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((dcounter.clone(), num_samples + 1f64));
+        expected
+            .get_mut(&rate_aggregate)
+            .unwrap()
+            .push((dcounter.clone(), (num_samples + 1f64) / seconds));
 
         // timers should be properly aggregated into all agregates except value
         let mut timer = Metric::new(1f64, MetricType::Timer(Vec::new()), None, None).unwrap();
@@ -471,13 +514,15 @@ mod tests {
 
         expected.get_mut(&Aggregate::Count).unwrap().push((timer.clone(), 10f64));
         expected.get_mut(&Aggregate::Min).unwrap().push((timer.clone(), 1f64));
-        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((timer.clone(), 10f64));
+        expected.get_mut(&Aggregate::UpdateCount).unwrap().push((timer.clone(), num_samples + 1f64));
         expected.get_mut(&Aggregate::Max).unwrap().push((timer.clone(), 84f64));
         expected.get_mut(&Aggregate::Sum).unwrap().push((timer.clone(), 316f64));
         // percentiles( 0.5 and 0.85 ) was counted in google spreadsheets
         expected.get_mut(&Aggregate::Median).unwrap().push((timer.clone(), 23.5f64));
+        expected.get_mut(&rate_aggregate).unwrap().push((timer.clone(), (num_samples + 1f64) / seconds));
         expected.get_mut(&Aggregate::Percentile(0.85, 85)).unwrap().push((timer.clone(), 60.85f64));
-        metrics.push(timer);
+
+        to_aggregate.push(timer);
 
         // sets should be properly aggregated into count of uniques and update count
         let mut set = Metric::new(1f64, MetricType::Set(HashSet::new()), None, None).unwrap();
@@ -492,11 +537,14 @@ mod tests {
 
         expected.get_mut(&Aggregate::Count).unwrap().push((set.clone(), 9f64));
         expected.get_mut(&Aggregate::UpdateCount).unwrap().push((set.clone(), 10f64));
-        // percentiles( 0.5 and 0.85 ) was counted in google spreadsheets
-        metrics.push(set);
+        expected.get_mut(&rate_aggregate).unwrap().push((set.clone(), (num_samples + 1f64) / seconds));
+        to_aggregate.push(set);
+
+        // remove unfilled expected arrays, it is ok because we created and filled them by ourselves
+        expected.retain(|_, v| !v.is_empty());
 
         let mut results = HashMap::new();
-        metrics
+        to_aggregate
             .into_iter()
             .map(|metric| {
                 let mut calc_metric = metric.clone();
@@ -525,7 +573,7 @@ mod tests {
         for (ec, ev) in &expected {
             //dbg!(ec);
             let rv = results.get(ec).expect("expected key not found in results");
-            assert_eq!(ev.len(), rv.len());
+            assert_eq!(ev.len(), rv.len(), "have \n {:?} \n expect \n {:?}", ev, rv);
             // for percentile a value can be a bit not equal
             if ec == &Aggregate::Percentile(0.85f64, 85) {
                 ev.iter()
