@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn metric_naming_aggregates() {
-        let all_aggs = possible_aggregates();
+        let all_aggs = possible_aggregates(Some(1.5f64));
         let mut intermediate: Vec<u8> = Vec::new();
         intermediate.resize(256, 0u8);
 
