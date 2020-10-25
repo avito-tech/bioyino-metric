@@ -14,23 +14,11 @@ use combine::{eof, skip_many};
 use combine::{optional, skip_many1, Parser};
 
 use bytes::{Buf, BytesMut};
+use lexical_core::{parse as parse_number, FromLexical};
+use num_traits::{AsPrimitive, Float};
 
 use crate::metric::{FromF64, Metric, MetricType};
 use crate::name::{sort_tags, MetricName, TagFormat};
-use num_traits::{AsPrimitive, Float};
-
-// (was) used for returning parsing result
-/*
-#[derive(Debug)]
-pub enum ParsedPart<F, I>
-where
-F: Float + FromStr + Debug + AsPrimitive<f64>,
-{
-Metric((PointerOffset<I>, PointerOffset<I>), Option<PointerOffset<I>>, Metric<F>),
-Trash(PointerOffset<I>),
-TotalTrash(PointerOffset<I>),
-}
-*/
 
 #[derive(Debug)]
 pub enum ParsedPart<F>
@@ -49,7 +37,7 @@ pub fn metric_stream_parser<'a, I, F>(max_unparsed: usize, max_tags_len: usize) 
 where
     I: 'a + combine::StreamOnce<Token = u8, Range = &'a [u8], Position = PointerOffset<[u8]>> + std::fmt::Debug + RangeStream,
     I::Error: ParseError<I::Token, I::Range, I::Position>,
-    F: 'a + Float + Debug + FromStr + AsPrimitive<f64> + FromF64 + Sync,
+    F: 'a + Float + Debug + FromStr + AsPrimitive<f64> + FromF64 + FromLexical + Sync,
     <F as FromStr>::Err: std::error::Error + Sync + Send + 'static,
 {
     // empty comments help rustfmt with formatting
@@ -84,12 +72,7 @@ where
     let val = take_while1(|c: u8| c != b'|' && c != b'\n')
         //
         .skip(byte(b'|'))
-        .and_then(|value| {
-            from_utf8(value)
-                //
-                .map_err(StreamErrorFor::<I>::other)
-                .map(|v| v.parse::<F>().map_err(StreamErrorFor::<I>::other))?
-        });
+        .and_then(|value| parse_number::<F>(value).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("value is not a valid number")));
 
     // This parses metric type
     let mtype = parse_bytes(b"ms")
@@ -108,12 +91,8 @@ where
             (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
         ));
 
-    let sampling = (parse_bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
-        // TODO replace from_utf8 with handmade parser removing recognize
-        from_utf8(val)
-            .map_err(StreamErrorFor::<I>::other)
-            .map(|v| v.parse::<f32>().map_err(StreamErrorFor::<I>::other))?
-    });
+    let sampling = (parse_bytes(b"|@"), recognize(unsigned_float))
+        .and_then(|(_, val)| parse_number::<F>(val).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("sampling value is not a valid number")));
 
     let metric = (
         optional(sign),
@@ -196,7 +175,7 @@ where
 impl<'a, F, E> Iterator for MetricParser<'a, F, E>
 where
     E: ParseErrorHandler,
-    F: Float + FromStr + AsPrimitive<f64> + FromF64 + Debug + Sync,
+    F: Float + FromStr + AsPrimitive<f64> + FromF64 + Debug + FromLexical + Sync,
     <F as FromStr>::Err: std::error::Error + Sync + Send + 'static,
 {
     type Item = (MetricName, Metric<F>);
@@ -367,7 +346,7 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1f64, MetricType::Counter, None, Some(1f32)).unwrap());
+        assert_eq!(metric, Metric::<f64>::new(1f64, MetricType::Counter, None, Some(1f64)).unwrap());
 
         assert_eq!(parser.next(), None);
     }
@@ -378,7 +357,7 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(12.65f64, MetricType::Counter, None, Some(1e-3f32)).unwrap());
+        assert_eq!(metric, Metric::<f64>::new(12.65f64, MetricType::Counter, None, Some(1e-3f64)).unwrap());
 
         assert_eq!(parser.next(), None);
     }
@@ -503,7 +482,7 @@ mod tests {
     #[test]
     fn parse_trashed_metric_with_tags() {
         let mut data = BytesMut::new();
-        data.extend_from_slice(b"trash\ngorets1:+1000|g\nTRASH\n\n\ngorets2;tag3=sh.t;t2=fuck:-1000|g|@0.5\nMORE;tra=sh;|TrasH\nFUUU");
+        data.extend_from_slice(b"trash\ngorets1:+1e3|g\nTRASH\n\n\ngorets2;tag3=sh.t;t2=fuck:-1e+3|g|@5e-1\nMORE;tra=sh;|TrasH\nFUUU");
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets1"[..]);
