@@ -13,34 +13,14 @@ use combine::{choice, position};
 use combine::{eof, skip_many};
 use combine::{optional, skip_many1, Parser};
 
+use lexical_core::{parse as parse_number, FromLexical};
+
 use bytes::{Buf, BytesMut};
 
 use crate::metric::{FromF64, Metric, MetricType};
 use crate::name::{sort_tags, MetricName, TagFormat};
+use crate::parser::{MetricParsingError, ParseErrorHandler, ParsedPart};
 use num_traits::{AsPrimitive, Float};
-
-/// Used for returning parsing result
-/*
-#[derive(Debug)]
-pub enum ParsedPart<F, I>
-where
-F: Float + FromStr + Debug + AsPrimitive<f64>,
-{
-Metric((PointerOffset<I>, PointerOffset<I>), Option<PointerOffset<I>>, Metric<F>),
-Trash(PointerOffset<I>),
-TotalTrash(PointerOffset<I>),
-}
-*/
-
-#[derive(Debug)]
-pub enum ParsedPart<F>
-where
-    F: Float + FromStr + Debug + AsPrimitive<f64>,
-{
-    Metric((PointerOffset<[u8]>, PointerOffset<[u8]>), Option<PointerOffset<[u8]>>, Metric<F>),
-    Trash(PointerOffset<[u8]>),
-    TotalTrash(PointerOffset<[u8]>),
-}
 
 // The current goal is to be fast, use less allocs and to not depend on error type. that's why
 // the signature may seem to be cryptic.
@@ -49,7 +29,7 @@ pub fn metric_stream_parser<'a, I, F>(max_unparsed: usize, max_tags_len: usize) 
 where
     I: 'a + combine::StreamOnce<Token = u8, Range = &'a [u8], Position = PointerOffset<[u8]>> + std::fmt::Debug + RangeStream,
     I::Error: ParseError<I::Token, I::Range, I::Position>,
-    F: 'a + Float + Debug + FromStr + AsPrimitive<f64> + FromF64 + Sync,
+    F: 'a + Float + Debug + FromStr + AsPrimitive<f64> + FromF64 + FromLexical + Sync,
     <F as FromStr>::Err: std::error::Error + Sync + Send + 'static,
 {
     // empty comments help rustfmt with formatting
@@ -85,10 +65,9 @@ where
         //
         .skip(byte(b'|'))
         .and_then(|value| {
-            from_utf8(value)
-                //
-                .map_err(StreamErrorFor::<I>::other)
-                .map(|v| v.parse::<F>().map_err(StreamErrorFor::<I>::other))?
+            parse_number::<F>(value)
+                //.map_err(StreamErrorFor::<I>::other)
+                .map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("value is not number"))
         });
 
     // This parses metric type
@@ -109,10 +88,9 @@ where
         ));
 
     let sampling = (parse_bytes(b"|@"), recognize(unsigned_float)).and_then(|(_, val)| {
-        // TODO replace from_utf8 with handmade parser removing recognize
-        from_utf8(val)
-            .map_err(StreamErrorFor::<I>::other)
-            .map(|v| v.parse::<f32>().map_err(StreamErrorFor::<I>::other))?
+        parse_number::<f32>(val)
+            //.map_err(StreamErrorFor::<I>::other)
+            .map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("value is not number"))
     });
 
     let metric = (
@@ -150,18 +128,6 @@ where
     ))
 }
 
-pub type MetricParsingError<'a> = easy::Errors<u8, &'a [u8], PointerOffset<[u8]>>;
-
-#[allow(unused_variables)]
-/// Used to handle parsing errors
-pub trait ParseErrorHandler {
-    fn handle(&self, buf: &[u8], pos: usize, e: MetricParsingError) {}
-}
-
-/// Does nothing about error, can be used for ignoring all errors
-pub struct DummyParseErrorHandler;
-impl ParseErrorHandler for DummyParseErrorHandler {}
-
 /// A high level parser to parse metric and split names from BytesMut.
 /// Follows an iterator pattern, which fires metrics until it is possible,
 /// modifying the buffer on the fly
@@ -196,7 +162,7 @@ where
 impl<'a, F, E> Iterator for MetricParser<'a, F, E>
 where
     E: ParseErrorHandler,
-    F: Float + FromStr + AsPrimitive<f64> + FromF64 + Debug + Sync,
+    F: Float + FromStr + AsPrimitive<f64> + FromF64 + Debug + FromLexical + Sync,
     <F as FromStr>::Err: std::error::Error + Sync + Send + 'static,
 {
     type Item = (MetricName, Metric<F>);
@@ -335,7 +301,6 @@ where
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

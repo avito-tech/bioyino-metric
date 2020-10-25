@@ -13,6 +13,7 @@ pub mod aggregate;
 pub mod metric;
 /// Metric name routines
 pub mod name;
+pub mod new_parser;
 /// Metric parsing routines
 pub mod parser;
 /// Convenience types
