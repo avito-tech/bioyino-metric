@@ -1,3 +1,8 @@
+# 0.4.0
+* sampling was not considered at all, now it is not a part of metric and is counted right away
+* rate aggregation has been added as `update_counter / aggregation_period`, with period provided externally
+* parser now parses floats from bytes without string conversion, giving around 10% speedup (see `benchmark-parser` branch for details)
+
 # 0.2.0
 
 * aggregation API has changed, supporting custom percentiles, specifying a list of aggregates, etc
