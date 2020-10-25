@@ -93,13 +93,9 @@ impl<F> Metric<F>
 where
     F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
 {
-    pub fn new(value: F, mtype: MetricType<F>, timestamp: Option<u64>, sampling: Option<f32>) -> Result<Self, MetricError> {
+    pub fn new(value: F, mtype: MetricType<F>, timestamp: Option<u64>, sampling: Option<F>) -> Result<Self, MetricError> {
         // consider sampling
-        let value = if let Some(sampling) = sampling {
-            value / F::from_f64(sampling as f64)
-        } else {
-            value
-        };
+        let value = if let Some(sampling) = sampling { value / sampling } else { value };
 
         let mut metric = Metric {
             value,
