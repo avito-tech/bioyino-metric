@@ -1,4 +1,6 @@
-# 0.4.0
+# 0.5.0
+* added Custom Histogram type, allowing to parse and aggregate histogram with defined range, i.e. `some.metric:1|H1.2,1.8`
+* removed DiffCounter metric type due to being broken and counter intuitive
 * sampling was not considered at all, now it is not a part of metric and is counted right away
 * rate aggregation has been added as `update_counter / aggregation_period`, with period provided externally
 * parser now parses floats from bytes without string conversion, giving around 10% speedup (see `benchmark-parser` branch for details)

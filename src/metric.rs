@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::fmt::Debug;
@@ -10,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::name::{find_tag_pos, MetricName, TagFormat};
-use crate::protocol_capnp::{gauge, metric as cmetric, metric_type};
+use crate::protocol_capnp::{gauge as gauge_v1, metric as cmetric_v1, metric_type};
+use crate::protocol_v2_capnp::{metric as cmetric, metric::metric_meta::tags, metric::metric_value};
 
 #[derive(Error, Debug)]
 pub enum MetricError {
@@ -23,6 +25,15 @@ pub enum MetricError {
     #[error("aggregating metrics of different types")]
     Aggregating,
 
+    #[error("custom histogram range mismatch")]
+    CustomHistrogramRange,
+
+    #[error("usage of deprecated feature")]
+    Deprecated,
+
+    #[error("this feature is not implemented yet")]
+    NotImplemented,
+
     #[error("decoding error: {}", _0)]
     Capnp(capnp::Error),
 
@@ -33,30 +44,19 @@ pub enum MetricError {
     BadTypeName(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum MetricType<F>
+#[derive(Debug, PartialEq)]
+/// This is the "view" of a metric coming from statsd as input.
+///
+/// While the types are same, it is different from the way it is represented internally
+pub enum StatsdType<F>
 where
-    F: Copy + PartialEq + Debug,
+    F: Debug,
 {
     Counter,
-    DiffCounter(F),
-    Timer(Vec<F>),
+    Timer,
     Gauge(Option<i8>),
-    Set(HashSet<u64>),
-    //    Histogram,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-/// A typed, optionally timestamped metric value (i.e. without name)
-pub struct Metric<F>
-where
-    F: Copy + PartialEq + Debug,
-{
-    pub value: F,
-    pub mtype: MetricType<F>,
-    pub timestamp: Option<u64>,
-    pub update_counter: u32,
-    //pub sampling: Option<f32>,
+    Set,
+    CustomHistogram(F, F),
 }
 
 pub trait FromF64 {
@@ -70,7 +70,7 @@ impl FromF64 for f64 {
 }
 
 impl FromF64 for f32 {
-    // TODO specilaization will give us a possibility to use any other float the same way
+    // TODO specilization will give us a possibility to use any other float the same way
     fn from_f64(value: f64) -> Self {
         let (mantissa, exponent, sign) = Float::integer_decode(value);
         let sign_f = f32::from(sign);
@@ -80,100 +80,324 @@ impl FromF64 for f32 {
     }
 }
 
-// TODO
-//impl<F> Eq for Metric<F>
-//F: PartialEq,
-//{
-//fn eq(&self, other: &Self) -> bool {
-////self.self.value == other.value
-//}
-//}
-
-impl<F> Metric<F>
+#[derive(Debug, PartialEq)]
+pub struct StatsdMetric<F>
 where
-    F: Float + Debug + AsPrimitive<f64> + FromF64 + Sync,
+    F: Debug,
 {
-    pub fn new(value: F, mtype: MetricType<F>, timestamp: Option<u64>, sampling: Option<F>) -> Result<Self, MetricError> {
-        // consider sampling
+    value: F,
+    mtype: StatsdType<F>,
+}
+
+impl<F> StatsdMetric<F>
+where
+    F: Debug + Float,
+{
+    pub fn new(value: F, mtype: StatsdType<F>, sampling: Option<F>) -> Result<Self, MetricError> {
         let value = if let Some(sampling) = sampling { value / sampling } else { value };
+        if let StatsdType::CustomHistogram(start, end) = mtype {
+            if start >= end || !start.is_finite() || !end.is_finite() {
+                return Err(MetricError::CustomHistrogramRange);
+            }
+        }
 
-        let mut metric = Metric {
-            value,
-            mtype,
-            timestamp,
-            update_counter: 1,
-        };
-
-        if let MetricType::Timer(ref mut agg) = metric.mtype {
-            agg.push(metric.value)
-        };
-        if let MetricType::Set(ref mut hs) = metric.mtype {
-            hs.insert(metric.value.as_().to_bits());
-        };
-
-        Ok(metric)
+        Ok(Self { value, mtype })
     }
+}
 
-    /// Join self with a new incoming metric depending on type
-    pub fn accumulate(&mut self, new: Metric<F>) -> Result<(), MetricError> {
-        use self::MetricType::*;
-        self.update_counter += new.update_counter;
-        match (&mut self.mtype, new.mtype) {
-            (&mut Counter, Counter) => {
-                self.value = self.value + new.value;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MetricValue<F>
+where
+    F: Copy + PartialEq + Debug,
+{
+    Gauge(F),
+    Counter(F),
+    Timer(Vec<F>),
+    Set(HashSet<u64>),
+    CustomHistogram(u64, Vec<(F, u64)>),
+}
+
+impl<F> MetricValue<F>
+where
+    F: Copy + PartialEq + Debug + Float + AsPrimitive<f64> + FromF64,
+{
+    /// accumulates a previously created metric data into self
+    pub fn accumulate(&mut self, new: MetricValue<F>) -> Result<(), MetricError> {
+        match (self, new) {
+            (&mut MetricValue::Counter(ref mut value), MetricValue::Counter(new)) => {
+                *value = *value + new;
             }
-            (&mut DiffCounter(ref mut previous), DiffCounter(_)) => {
-                // FIXME: this is most probably incorrect when joining with another
-                // non-fresh metric count2 != 1
-                let prev = *previous;
-                let diff = if new.value > prev { new.value - prev } else { new.value };
-                *previous = new.value;
-                self.value = self.value + diff;
+            (&mut MetricValue::Gauge(ref mut value), MetricValue::Gauge(new)) => {
+                *value = new;
             }
-            (&mut Gauge(_), Gauge(Some(1))) => {
-                self.value = self.value + new.value;
-            }
-            (&mut Gauge(_), Gauge(Some(-1))) => {
-                self.value = self.value - new.value;
-            }
-            (&mut Gauge(_), Gauge(None)) => {
-                self.value = new.value;
-            }
-            (&mut Gauge(_), Gauge(Some(_))) => {
-                return Err(MetricError::Aggregating.into());
-            }
-            (&mut Timer(ref mut agg), Timer(ref mut agg2)) => {
-                self.value = new.value;
+            (&mut MetricValue::Timer(ref mut agg), MetricValue::Timer(ref mut agg2)) => {
                 agg.append(agg2);
             }
-            (&mut Set(ref mut hs), Set(ref mut hs2)) => {
+            (&mut MetricValue::Set(ref mut hs), MetricValue::Set(ref mut hs2)) => {
                 hs.extend(hs2.iter());
             }
+            (&mut MetricValue::CustomHistogram(ref mut left_c1, ref mut buckets1), MetricValue::CustomHistogram(left_c2, ref buckets2)) => {
+                if buckets1.len() != buckets2.len() {
+                    return Err(MetricError::CustomHistrogramRange);
+                }
 
+                // for performance reasons we skip some checks here considering
+                // they are not passing the constructors
+                // (from_statsd_metric and for StatsdMetric::CustomHistogram)
+                // the only risks are to get bad data out of them
+                //
+                // possible edge cases are
+                // * buckets1.len() == 0 or buckets2.len() == 0 - not really an issue, meaning
+                // one-bucket histogram actually
+                // * +-inf/nan in floats
+
+                // another source of error may be when someone wants to change the boundaries for metric witht the same name
+                // if we blindly accept new values, we'll get the incorrect or partially incorrect data for the aggregation period
+                // if we check the boundaries, we'll get incorrect data anyways, but we'll let the
+                // sender know it returning error
+                // as of now we prefer observability at the cost of small(intuitive assumption) performance loss
+                // in some future we may change this to an option or even better: a compile-time flag
+                if buckets1.len() > 0 && buckets2.len() > 0 && buckets1[0].0 != buckets2[0].0 {
+                    return Err(MetricError::CustomHistrogramRange);
+                }
+
+                // we also intentionally skip the part where floats(i.e bucket boundaries) may be unequal due to
+                // approximation
+                //
+                // here's the cases when floats may be unequal:
+                // * someone uses bad float values on input using schema wrong or using non-IEEE
+                // floats
+                // * someone uses bioyino compiled for f32, which gives different numbers when
+                // bucket ranges are counted; this case should only give a small error
+
+                buckets1.iter_mut().zip(buckets2.iter()).map(|((_, ref mut v1), (_, v2))| *v1 += v2).last();
+                *left_c1 += left_c2;
+            }
             (_m1, _m2) => {
-                return Err(MetricError::Aggregating.into());
+                return Err(MetricError::Aggregating);
             }
         };
         Ok(())
     }
 
-    pub fn from_capnp(reader: cmetric::Reader) -> Result<(MetricName, Metric<F>), MetricError> {
-        //let name: Bytes = reader.get_name().map_err(MetricError::Capnp)?.into();
-        let name: &[u8] = reader.get_name().map_err(MetricError::Capnp)?.as_bytes();
-        let name = Bytes::copy_from_slice(name);
-        let tag_pos = find_tag_pos(&name[..], TagFormat::Graphite);
-        let name = MetricName::from_raw_parts(name, tag_pos);
-        let value: F = F::from_f64(reader.get_value());
+    /// Accumulates a statsd typed metric into self
+    pub fn accumulate_statsd(&mut self, new: StatsdMetric<F>) -> Result<(), MetricError> {
+        match (self, &new.mtype) {
+            (MetricValue::Gauge(ref mut v), StatsdType::Gauge(Some(sign))) => {
+                if *sign < 0 {
+                    *v = *v - new.value;
+                } else {
+                    *v = *v + new.value;
+                }
+                Ok(())
+            }
+            (MetricValue::Gauge(ref mut v), StatsdType::Gauge(None)) => {
+                *v = new.value;
+                Ok(())
+            }
 
-        let mtype = reader.get_type().map_err(MetricError::Capnp)?;
-        let mtype = match mtype.which().map_err(MetricError::CapnpSchema)? {
-            metric_type::Which::Counter(()) => MetricType::Counter,
-            metric_type::Which::DiffCounter(c) => MetricType::DiffCounter(F::from_f64(c)),
+            (MetricValue::Counter(ref mut v), StatsdType::Counter) => {
+                *v = *v + new.value;
+                Ok(())
+            }
+            (MetricValue::Timer(ref mut acc), StatsdType::Timer) => {
+                acc.push(new.value);
+                Ok(())
+            }
+            (MetricValue::Set(ref mut acc), StatsdType::Set) => {
+                acc.insert(new.value.as_().to_bits());
+                Ok(())
+            }
+            (MetricValue::CustomHistogram(ref mut left, ref mut buckets), StatsdType::CustomHistogram(start, end)) => {
+                // check if histogram limits are valid
+                if *start != buckets[0].0 || *end != buckets[buckets.len() - 1].0 {
+                    return Err(MetricError::CustomHistrogramRange);
+                }
+
+                // search the first matching bucket starting from the end of all buckets
+                // reverse the iteration for that, then count the right position
+                match buckets.iter().rev().position(|(v, _)| new.value >= *v) {
+                    Some(pos) => {
+                        let real_pos = buckets.len() - 1 - pos;
+                        buckets[real_pos].1 += 1;
+                    }
+                    None => *left += 1,
+                }
+                Ok(())
+            }
+            (_, _) => {
+                return Err(MetricError::Aggregating);
+            }
+        }
+    }
+
+    pub fn from_statsd_metric(m: &StatsdMetric<F>, buckets: usize) -> Result<Self, MetricError> {
+        match m.mtype {
+            StatsdType::Gauge(sign) => {
+                let value = if let Some(sign) = sign {
+                    if sign < 0 {
+                        -m.value
+                    } else {
+                        m.value
+                    }
+                } else {
+                    m.value
+                };
+                Ok(MetricValue::Gauge(value))
+            }
+            StatsdType::Counter => Ok(MetricValue::Counter(m.value)),
+            StatsdType::Timer => {
+                let mut mv = Vec::with_capacity(1);
+                mv.push(m.value);
+                Ok(MetricValue::Timer(mv))
+            }
+            StatsdType::Set => {
+                let mut mhs = HashSet::with_capacity(1);
+                //ms.insert(m.value);
+                mhs.insert(m.value.as_().to_bits());
+                Ok(MetricValue::Set(mhs))
+            }
+            StatsdType::CustomHistogram(start, end) => {
+                if buckets < 3 {
+                    // buckets always have the left one, and the ones stat start with `start` and
+                    // `end`
+                    return Err(MetricError::CustomHistrogramRange);
+                }
+                let step = (end - start) / F::from_f64((buckets - 1) as f64); // (buckets - 1)  is to not count the left one
+                let mut bvec = Vec::with_capacity(buckets);
+                bvec.resize(buckets, (F::from_f64(0f64), 0));
+
+                let mut bucket_found = None;
+                let mut current = start;
+                for i in 0..buckets {
+                    if m.value >= current {
+                        bucket_found = Some(i);
+                    }
+                    bvec[i].0 = current;
+
+                    if i == buckets - 1 {
+                        // avoid accumulating error: accept end value as is, not as accumulated
+                        // step
+                        current = end
+                    } else {
+                        current = current + step;
+                    }
+                }
+                if let Some(idx) = bucket_found {
+                    bvec[idx].1 = 1;
+                    Ok(MetricValue::CustomHistogram(0, bvec))
+                } else {
+                    Ok(MetricValue::CustomHistogram(1, bvec))
+                }
+            }
+        }
+    }
+
+    // since v1 requires separate value, we requre this function to return it for further
+    // setting in metric
+    pub fn fill_capnp_v1<'a>(&self, builder: &mut metric_type::Builder<'a>) -> f64 {
+        match self {
+            MetricValue::Counter(value) => {
+                builder.set_counter(());
+                value.as_()
+            }
+            MetricValue::Gauge(value) => {
+                let mut g_builder = builder.reborrow().init_gauge();
+                g_builder.set_unsigned(());
+                value.as_()
+            }
+            MetricValue::Timer(ref v) => {
+                let mut timer_builder = builder.reborrow().init_timer(v.len() as u32);
+                v.iter()
+                    .enumerate()
+                    .map(|(idx, value)| {
+                        let value: f64 = (*value).as_();
+                        timer_builder.set(idx as u32, value);
+                    })
+                    .last();
+                0f64
+            }
+            MetricValue::Set(ref v) => {
+                let mut sebuilder = builder.reborrow().init_set(v.len() as u32);
+                v.iter()
+                    .enumerate()
+                    .map(|(idx, value)| {
+                        sebuilder.set(idx as u32, *value);
+                    })
+                    .last();
+                0f64
+            }
+            MetricValue::CustomHistogram(left, ref buckets) => {
+                let mut h_builder = builder.reborrow().init_custom_histogram();
+                h_builder.set_left_bucket(*left);
+                let mut bucket_builder = h_builder.init_buckets(buckets.len() as u32);
+                buckets
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (boundary, counter))| {
+                        let mut single_bucket = bucket_builder.reborrow().get(idx as u32);
+                        single_bucket.set_value(boundary.as_());
+                        single_bucket.set_counter(*counter);
+                    })
+                    .last();
+                0f64
+            }
+        }
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut metric_value::Builder<'a>) {
+        match self {
+            MetricValue::Gauge(value) => builder.set_gauge(value.as_()),
+            MetricValue::Counter(value) => builder.set_counter(value.as_()),
+            MetricValue::Timer(ref v) => {
+                let mut timer_builder = builder.reborrow().init_timer(v.len() as u32);
+                v.iter()
+                    .enumerate()
+                    .map(|(idx, value)| {
+                        let value: f64 = (*value).as_();
+                        timer_builder.set(idx as u32, value);
+                    })
+                    .last();
+            }
+            MetricValue::Set(ref v) => {
+                let mut set_builder = builder.reborrow().init_set(v.len() as u32);
+                v.iter()
+                    .enumerate()
+                    .map(|(idx, value)| {
+                        set_builder.set(idx as u32, *value);
+                    })
+                    .last();
+            }
+            MetricValue::CustomHistogram(left, ref buckets) => {
+                let mut h_builder = builder.reborrow().init_custom_histogram();
+                h_builder.set_left_bucket(*left);
+                let mut bucket_builder = h_builder.init_buckets(buckets.len() as u32);
+                buckets
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (boundary, counter))| {
+                        let mut single_bucket = bucket_builder.reborrow().get(idx as u32);
+                        single_bucket.set_value(boundary.as_());
+                        single_bucket.set_counter(*counter);
+                    })
+                    .last();
+            }
+        };
+    }
+
+    pub fn from_capnp_v1(reader: metric_type::Reader, value: F) -> Result<Self, MetricError> {
+        match reader.which().map_err(MetricError::CapnpSchema)? {
+            metric_type::Which::Counter(()) => Ok(MetricValue::Counter(value)),
+            metric_type::Which::DiffCounter(_) => Err(MetricError::Deprecated),
             metric_type::Which::Gauge(reader) => {
                 let reader = reader.map_err(MetricError::Capnp)?;
+                // since we know the protocol is only used for internal purpose
+                // we can assume the signt of the gauge is not meaningful when getting it
+                // from capnp message
+                // this means we can replace the value in a gauge
                 match reader.which().map_err(MetricError::CapnpSchema)? {
-                    gauge::Which::Unsigned(()) => MetricType::Gauge(None),
-                    gauge::Which::Signed(sign) => MetricType::Gauge(Some(sign)),
+                    gauge_v1::Which::Unsigned(()) => Ok(MetricValue::Gauge(value)),
+                    gauge_v1::Which::Signed(_) => Ok(MetricValue::Gauge(value)),
                 }
             }
             metric_type::Which::Timer(reader) => {
@@ -181,21 +405,141 @@ where
                 let mut v = Vec::new();
                 v.reserve_exact(reader.len() as usize);
                 reader.iter().map(|ms| v.push(FromF64::from_f64(ms))).last();
-                MetricType::Timer(v)
+                Ok(MetricValue::Timer(v))
             }
             metric_type::Which::Set(reader) => {
                 let reader = reader.map_err(MetricError::Capnp)?;
                 let v = reader.iter().collect();
-                MetricType::Set(v)
+                Ok(MetricValue::Set(v))
+            }
+            metric_type::Which::CustomHistogram(reader) => {
+                let reader = reader.map_err(MetricError::Capnp)?;
+                let left = reader.get_left_bucket();
+                let breader = reader.get_buckets().map_err(MetricError::Capnp)?;
+                let mut buckets = Vec::new();
+                buckets.reserve_exact(breader.len() as usize);
+                breader.iter().map(|r| buckets.push((FromF64::from_f64(r.get_value()), r.get_counter()))).last();
+                Ok(MetricValue::CustomHistogram(left, buckets))
+            }
+        }
+    }
+
+    pub fn from_capnp(reader: metric_value::Reader) -> Result<Self, MetricError> {
+        match reader.which().map_err(MetricError::CapnpSchema)? {
+            metric_value::Which::Gauge(value) => Ok(MetricValue::Gauge(F::from_f64(value))),
+            metric_value::Which::Counter(value) => Ok(MetricValue::Counter(F::from_f64(value))),
+            metric_value::Which::Timer(reader) => {
+                let reader = reader.map_err(MetricError::Capnp)?;
+                let mut v = Vec::new();
+                v.reserve_exact(reader.len() as usize);
+                reader.iter().map(|ms| v.push(FromF64::from_f64(ms))).last();
+                Ok(MetricValue::Timer(v))
+            }
+            metric_value::Which::Set(reader) => {
+                let reader = reader.map_err(MetricError::Capnp)?;
+                let v = reader.iter().collect();
+                Ok(MetricValue::Set(v))
+            }
+            metric_value::Which::CustomHistogram(reader) => {
+                let reader = reader.map_err(MetricError::Capnp)?;
+                let left = reader.get_left_bucket();
+                let breader = reader.get_buckets().map_err(MetricError::Capnp)?;
+                let mut buckets = Vec::new();
+                buckets.reserve_exact(breader.len() as usize);
+                breader.iter().map(|r| buckets.push((FromF64::from_f64(r.get_value()), r.get_counter()))).last();
+                Ok(MetricValue::CustomHistogram(left, buckets))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A typed, optionally timestamped metric value (i.e. without name)
+pub struct Metric<F>
+where
+    F: Copy + PartialEq + Debug,
+{
+    value: MetricValue<F>,
+    timestamp: Option<u64>,
+    update_counter: u32,
+}
+
+impl<F> Metric<F>
+where
+    F: Float + Debug + FromF64 + AsPrimitive<f64>,
+{
+    /// Creates a new metric
+    /// Only metric type is required because it may already contain the value or many accumulated
+    /// inside. If value is provided it will be accumulated according to the type used
+    ///
+    /// Sampling will be applied to value before accumulating if provided
+    ///
+    /// Timestamp wil be saved for later use
+    pub fn new(value: MetricValue<F>, timestamp: Option<u64>) -> Self {
+        let metric = Metric {
+            value,
+            timestamp,
+            update_counter: 1,
+        };
+
+        metric
+    }
+
+    pub fn from_statsd(m: &StatsdMetric<F>, buckets: usize, timestamp: Option<u64>) -> Result<Self, MetricError> {
+        let value = MetricValue::from_statsd_metric(m, buckets)?;
+        Ok(Self::new(value, timestamp))
+    }
+
+    pub fn updates(&self) -> F {
+        F::from_f64(f64::from(self.update_counter))
+    }
+
+    pub fn value(&self) -> &MetricValue<F> {
+        &self.value
+    }
+
+    pub fn timestamp(&self) -> Option<u64> {
+        self.timestamp
+    }
+
+    pub fn sort_timer(&mut self) {
+        if let MetricValue::Timer(ref mut agg) = self.value {
+            agg.sort_unstable_by(|ref v1, ref v2| v1.partial_cmp(v2).unwrap());
+        }
+    }
+
+    pub fn accumulate(&mut self, other: Metric<F>) -> Result<(), MetricError> {
+        let Metric {
+            value,
+            timestamp,
+            update_counter,
+        } = other;
+        self.update_counter += update_counter;
+        self.timestamp = match (self.timestamp, timestamp) {
+            (_, None) => self.timestamp,
+            (None, Some(value)) => Some(value),
+            (Some(ref value), Some(ref new)) => {
+                if value > new {
+                    Some(*value)
+                } else {
+                    Some(*new)
+                }
             }
         };
+        self.value.accumulate(value)
+    }
 
-        let timestamp = if reader.has_timestamp() {
-            Some(reader.get_timestamp().map_err(MetricError::Capnp)?.get_ts())
-        } else {
-            None
-        };
+    pub fn accumulate_statsd(&mut self, statsd: StatsdMetric<F>) -> Result<(), MetricError> {
+        self.update_counter += 1;
+        self.value.accumulate_statsd(statsd)
+    }
 
+    pub fn from_capnp_v1(reader: cmetric_v1::Reader) -> Result<(MetricName, Metric<F>), MetricError> {
+        let name: &[u8] = reader.get_name().map_err(MetricError::Capnp)?.as_bytes();
+        let name = Bytes::copy_from_slice(name);
+        let tag_pos = find_tag_pos(&name[..], TagFormat::Graphite);
+        let name = MetricName::from_raw_parts(name, tag_pos);
+        let value: F = F::from_f64(reader.get_value());
         let (sampling, up_counter) = match reader.get_meta() {
             Ok(reader) => (
                 if reader.has_sampling() {
@@ -214,62 +558,65 @@ where
         } else {
             value
         };
-        // we should NOT use Metric::new here because it is not a newly created metric
-        // we'd get duplicate value in timer/set metrics if we used new
-        let metric: Metric<F> = Metric {
-            value,
-            mtype,
-            timestamp,
-            update_counter: if let Some(c) = up_counter { c } else { 1 },
+
+        // IMPORTANT: have this after sampling applied
+        let mvalue = MetricValue::from_capnp_v1(reader.get_type().map_err(MetricError::Capnp)?, value)?;
+
+        let timestamp = if reader.has_timestamp() {
+            Some(reader.get_timestamp().map_err(MetricError::Capnp)?.get_ts())
+        } else {
+            None
         };
+
+        let mut metric: Metric<F> = Metric::new(mvalue, timestamp);
+
+        if let Some(c) = up_counter {
+            metric.update_counter = c
+        }
 
         Ok((name, metric))
     }
 
-    pub fn fill_capnp<'a>(&self, builder: &mut cmetric::Builder<'a>) {
+    pub fn from_capnp(reader: cmetric::Reader) -> Result<(MetricName, Metric<F>), MetricError> {
+        let name: &[u8] = reader.get_name().map_err(MetricError::Capnp)?.as_bytes();
+        let name = Bytes::copy_from_slice(name);
+
+        let m_reader = reader.get_meta().map_err(MetricError::Capnp)?;
+        let tag_pos = match m_reader.get_tags().which().map_err(MetricError::CapnpSchema)? {
+            tags::Which::NoTags(()) => None,
+            tags::Which::Graphite(pos) => Some(pos as usize),
+        };
+
+        let name = MetricName::from_raw_parts(name, tag_pos);
+
+        let update_counter = m_reader.get_update_counter();
+
+        let mv_reader = reader.get_value().map_err(MetricError::Capnp)?;
+        let mvalue = MetricValue::from_capnp(mv_reader)?;
+
+        let timestamp = if reader.has_timestamp() {
+            Some(reader.get_timestamp().map_err(MetricError::Capnp)?.get_ts())
+        } else {
+            None
+        };
+
+        let mut metric: Metric<F> = Metric::new(mvalue, timestamp);
+        metric.update_counter = update_counter;
+
+        Ok((name, metric))
+    }
+
+    pub fn fill_capnp_v1<'a>(&self, builder: &mut cmetric_v1::Builder<'a>) {
         // no name is known at this stage
-        // value
-        builder.set_value(self.value.as_());
-        // mtype
-        {
-            let mut t_builder = builder.reborrow().init_type();
-            match self.mtype {
-                MetricType::Counter => t_builder.set_counter(()),
-                MetricType::DiffCounter(v) => t_builder.set_diff_counter(v.as_()),
-                MetricType::Gauge(sign) => {
-                    let mut g_builder = t_builder.init_gauge();
-                    match sign {
-                        Some(v) => g_builder.set_signed(v),
-                        None => g_builder.set_unsigned(()),
-                    }
-                }
-                MetricType::Timer(ref v) => {
-                    let mut timer_builder = t_builder.init_timer(v.len() as u32);
-                    v.iter()
-                        .enumerate()
-                        .map(|(idx, value)| {
-                            let value: f64 = (*value).as_();
-                            timer_builder.set(idx as u32, value);
-                        })
-                        .last();
-                }
-                MetricType::Set(ref v) => {
-                    let mut set_builder = t_builder.init_set(v.len() as u32);
-                    v.iter()
-                        .enumerate()
-                        .map(|(idx, value)| {
-                            set_builder.set(idx as u32, *value);
-                        })
-                        .last();
-                }
-            }
-        }
+
+        // fill value and mtype
+        let mut t_builder = builder.reborrow().init_type();
+        let value: f64 = self.value.fill_capnp_v1(&mut t_builder);
+        builder.set_value(value);
 
         // timestamp
-        {
-            if let Some(timestamp) = self.timestamp {
-                builder.reborrow().init_timestamp().set_ts(timestamp);
-            }
+        if let Some(timestamp) = self.timestamp {
+            builder.reborrow().init_timestamp().set_ts(timestamp);
         }
 
         // meta
@@ -277,28 +624,87 @@ where
 
         // NOTE: We do not set the sampling, because we don't have it stored
         // converting it at input instead.
-        // We, ourselves don't sample any metrics
-
+        // in this function though we don't sample any metrics
         m_builder.set_update_counter(self.update_counter);
     }
 
+    /// Fills the supplied builder, not touching the name related parts
+    pub fn fill_capnp<'a>(&self, builder: &mut cmetric::Builder<'a>) {
+        // fill value and mtype
+        let mut v_builder = builder.reborrow().init_value();
+
+        self.value.fill_capnp(&mut v_builder);
+        // timestamp
+        if let Some(timestamp) = self.timestamp {
+            builder.reborrow().init_timestamp().set_ts(timestamp);
+        }
+
+        // meta
+        let mut m_builder = builder.reborrow().init_meta();
+        m_builder.set_update_counter(self.update_counter);
+    }
+
+    /// fills the name related parts. `unicode_checked` flag must signal that name part was
+    /// already checked to be valid unicode
+    pub fn fill_capnp_name<'a>(&self, builder: &mut cmetric::Builder<'a>, name: &MetricName, unicode_checked: bool) {
+        let m_builder = if builder.has_meta() {
+            builder.reborrow().get_meta().unwrap()
+        } else {
+            builder.reborrow().init_meta()
+        };
+
+        let mut t_builder = m_builder.init_tags();
+        if let Some(pos) = name.tag_pos {
+            t_builder.set_graphite(pos as u64);
+        } else {
+            t_builder.set_no_tags(());
+        }
+
+        let name = if unicode_checked {
+            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&name.name) })
+        } else {
+            String::from_utf8_lossy(&name.name)
+        };
+        builder.set_name(&name);
+    }
+
     // may be useful in future somehow
-    pub fn as_capnp<A: Allocator>(&self, allocator: A) -> Builder<A> {
+    pub fn as_capnp_v1<A: Allocator>(&self, allocator: A) -> Builder<A> {
         let mut builder = Builder::new(allocator);
         {
-            let mut root = builder.init_root::<cmetric::Builder>();
-            self.fill_capnp(&mut root);
+            let mut root = builder.init_root::<cmetric_v1::Builder>();
+            self.fill_capnp_v1(&mut root);
         }
         builder
     }
+
+    /// the boolean in name tuple should show if unicode validation was performed on name
+    /// see fill_capnp_name for details
+    pub fn as_capnp<A: Allocator>(&self, allocator: A, name: Option<(&MetricName, bool)>) -> Builder<A> {
+        let mut builder = Builder::new(allocator);
+        let mut root = builder.init_root::<cmetric::Builder>();
+        self.fill_capnp(&mut root);
+        if let Some((n, vu)) = name {
+            self.fill_capnp_name(&mut root, n, vu);
+        }
+        builder
+    }
+
     // may be useful in future somehow
-    pub fn as_capnp_heap(&self) -> Builder<HeapAllocator> {
+    pub fn as_capnp_heap_v1(&self) -> Builder<HeapAllocator> {
         let allocator = HeapAllocator::new();
         let mut builder = Builder::new(allocator);
         {
-            let mut root = builder.init_root::<cmetric::Builder>();
-            self.fill_capnp(&mut root);
+            let mut root = builder.init_root::<cmetric_v1::Builder>();
+            self.fill_capnp_v1(&mut root);
         }
+        builder
+    }
+
+    /// builds a complete capnp structure
+    pub fn as_capnp_heap(&self, name: Option<(&MetricName, bool)>) -> Builder<HeapAllocator> {
+        let allocator = HeapAllocator::new();
+        let builder = self.as_capnp(allocator, name);
         builder
     }
 }
@@ -310,23 +716,23 @@ where
 pub enum MetricTypeName {
     Default,
     Counter,
-    DiffCounter,
     Timer,
     Gauge,
     Set,
+    CustomHistogram,
 }
 
 impl MetricTypeName {
     pub fn from_metric<F>(m: &Metric<F>) -> Self
     where
-        F: Copy + PartialEq + Debug,
+        F: Copy + PartialEq + Debug + Float + FromF64 + AsPrimitive<f64>,
     {
-        match m.mtype {
-            MetricType::Counter => MetricTypeName::Counter,
-            MetricType::DiffCounter(_) => MetricTypeName::DiffCounter,
-            MetricType::Timer(_) => MetricTypeName::Timer,
-            MetricType::Gauge(_) => MetricTypeName::Gauge,
-            MetricType::Set(_) => MetricTypeName::Set,
+        match m.value() {
+            MetricValue::Counter(_) => MetricTypeName::Counter,
+            MetricValue::Timer(_) => MetricTypeName::Timer,
+            MetricValue::Gauge(_) => MetricTypeName::Gauge,
+            MetricValue::Set(_) => MetricTypeName::Set,
+            MetricValue::CustomHistogram(_, _) => MetricTypeName::CustomHistogram,
         }
     }
 }
@@ -338,10 +744,10 @@ impl TryFrom<&str> for MetricTypeName {
         match s {
             "default" => Ok(MetricTypeName::Default),
             "counter" => Ok(MetricTypeName::Counter),
-            "diff-counter" => Ok(MetricTypeName::DiffCounter),
             "timer" => Ok(MetricTypeName::Timer),
             "gauge" => Ok(MetricTypeName::Gauge),
             "set" => Ok(MetricTypeName::Set),
+            "custom-histogram" => Ok(MetricTypeName::CustomHistogram),
             _ => Err(MetricError::BadTypeName(s.to_string())),
         }
     }
@@ -352,10 +758,10 @@ impl ToString for MetricTypeName {
         match self {
             MetricTypeName::Default => "default",
             MetricTypeName::Counter => "counter",
-            MetricTypeName::DiffCounter => "diff-counter",
             MetricTypeName::Timer => "timer",
             MetricTypeName::Gauge => "gauge",
             MetricTypeName::Set => "set",
+            MetricTypeName::CustomHistogram => "custom-histogram",
         }
         .to_string()
     }
@@ -368,9 +774,143 @@ mod tests {
     use capnp::serialize::{read_message, write_message};
     type Float = f64;
 
+    #[test]
+    fn type_gauge_test() {
+        let smetric = StatsdMetric::new(2f64, StatsdType::Gauge(Some(-1)), None).unwrap();
+        assert_eq!(smetric.value, 2f64);
+        assert_eq!(smetric.mtype, StatsdType::Gauge(Some(-1)));
+
+        let mut mvalue = MetricValue::from_statsd_metric(&smetric, 10).unwrap();
+        assert_eq!(mvalue, MetricValue::Gauge(-2f64));
+
+        let smetric = StatsdMetric::new(3f64, StatsdType::Gauge(Some(1)), None).unwrap();
+        mvalue.accumulate_statsd(smetric).unwrap();
+        assert_eq!(mvalue, MetricValue::Gauge(1f64));
+
+        let smetric = StatsdMetric::new(42f64, StatsdType::Gauge(None), None).unwrap();
+        mvalue.accumulate_statsd(smetric).unwrap();
+        assert_eq!(mvalue, MetricValue::Gauge(42f64));
+    }
+
+    #[test]
+    fn type_counter_test() {
+        let smetric = StatsdMetric::new(2f64, StatsdType::Counter, Some(0.1)).unwrap();
+        assert_eq!(smetric.value, 20f64);
+        assert_eq!(smetric.mtype, StatsdType::Counter);
+
+        let mut mvalue = MetricValue::from_statsd_metric(&smetric, 10).unwrap();
+        assert_eq!(mvalue, MetricValue::Counter(20f64));
+
+        let smetric = StatsdMetric::new(3f64, StatsdType::Counter, None).unwrap();
+        mvalue.accumulate_statsd(smetric).unwrap();
+        assert_eq!(mvalue, MetricValue::Counter(23f64));
+    }
+
+    #[test]
+    fn type_timer_test() {
+        let smetric = StatsdMetric::new(2f64, StatsdType::Timer, Some(0.1)).unwrap();
+        assert_eq!(smetric.value, 20f64);
+        assert_eq!(smetric.mtype, StatsdType::Timer);
+
+        let mut mvalue = MetricValue::from_statsd_metric(&smetric, 10).unwrap();
+        assert_eq!(mvalue, MetricValue::Timer(vec![20f64]));
+
+        let smetric = StatsdMetric::new(3f64, StatsdType::Timer, None).unwrap();
+        mvalue.accumulate_statsd(smetric).unwrap();
+        assert_eq!(mvalue, MetricValue::Timer(vec![20f64, 3f64]));
+    }
+
+    #[test]
+    fn type_set_test() {
+        let smetric = StatsdMetric::new(2f64, StatsdType::Set, Some(0.1)).unwrap();
+        assert_eq!(smetric.value, 20f64);
+        assert_eq!(smetric.mtype, StatsdType::Set);
+
+        let mut mvalue = MetricValue::from_statsd_metric(&smetric, 10).unwrap();
+        let mut expected = HashSet::new();
+        expected.insert(20f64.to_bits());
+        assert_eq!(mvalue, MetricValue::Set(expected.clone()));
+
+        let smetric = StatsdMetric::new(3f64, StatsdType::Set, None).unwrap();
+        mvalue.accumulate_statsd(smetric).unwrap();
+        expected.insert(3f64.to_bits());
+        assert_eq!(mvalue, MetricValue::Set(expected));
+    }
+
+    #[test]
+    fn type_histogram_test() {
+        // do not accept bad ranges
+        let bad = StatsdMetric::new(2f64, StatsdType::CustomHistogram(1f64, 0f64), None);
+        assert!(bad.is_err());
+
+        let bad = StatsdMetric::new(2f64, StatsdType::CustomHistogram(1f64, f64::NAN), None);
+        assert!(bad.is_err());
+
+        // ensure sampling is considered
+        let smetric = StatsdMetric::new(5f64, StatsdType::CustomHistogram(3f64, 7f64), Some(0.1)).unwrap();
+        assert_eq!(smetric.value, 50f64);
+        assert_eq!(smetric.mtype, StatsdType::CustomHistogram(3f64, 7f64));
+
+        // ensure coutners and buckets are working as intended
+        let smetric = StatsdMetric::new(5f64, StatsdType::CustomHistogram(3f64, 7f64), None).unwrap();
+        let mvalue = MetricValue::from_statsd_metric(&smetric, 3).unwrap();
+        let expected = MetricValue::CustomHistogram(0, vec![(3f64, 0), (5f64, 1), (7f64, 0)]);
+        assert_eq!(mvalue, expected);
+
+        // ensure left bucket is filled
+        let smetric = StatsdMetric::new(-3f64, StatsdType::CustomHistogram(3f64, 7f64), None).unwrap();
+        let mvalue = MetricValue::from_statsd_metric(&smetric, 3).unwrap();
+        let expected = MetricValue::CustomHistogram(1, vec![(3f64, 0), (5f64, 0), (7f64, 0)]);
+        assert_eq!(mvalue, expected);
+
+        // ensure right bucket is filled
+        let smetric = StatsdMetric::new(5000f64, StatsdType::CustomHistogram(3f64, 7f64), None).unwrap();
+        let mvalue = MetricValue::from_statsd_metric(&smetric, 3).unwrap();
+        let expected = MetricValue::CustomHistogram(0, vec![(3f64, 0), (5f64, 0), (7f64, 1)]);
+        assert_eq!(mvalue, expected);
+
+        // ensure accumulation is NOT working for bad data
+        let mut mvalue = MetricValue::CustomHistogram(0, vec![(3f64, 3), (5f64, 0), (7f64, 0)]);
+        assert!(mvalue.accumulate(MetricValue::CustomHistogram(10, vec![(3f64, 3), (7f64, 0)])).is_err());
+        assert!(mvalue
+            .accumulate(MetricValue::CustomHistogram(10, vec![(2f64, 3), (4f64, 0), (6f64, 0)]))
+            .is_err());
+
+        // ensure accumulation is working
+        let mut mvalue = MetricValue::CustomHistogram(0, vec![(3f64, 3), (5f64, 0), (7f64, 0)]);
+        mvalue
+            .accumulate(MetricValue::CustomHistogram(10, vec![(3f64, 3), (5f64, 1), (7f64, 1)]))
+            .unwrap();
+        let expected = MetricValue::CustomHistogram(10, vec![(3f64, 6), (5f64, 1), (7f64, 1)]);
+        assert_eq!(mvalue, expected);
+
+        // ensure accumulation from statsd works
+        let smetric1 = StatsdMetric::new(6f64, StatsdType::CustomHistogram(3f64, 7f64), None).unwrap();
+        let smetric2 = StatsdMetric::new(-3f64, StatsdType::CustomHistogram(3f64, 7f64), None).unwrap();
+        let smetric3 = StatsdMetric::new(5000f64, StatsdType::CustomHistogram(3f64, 7f64), None).unwrap();
+
+        let mut mvalue = MetricValue::CustomHistogram(1, vec![(3f64, 0), (5f64, 0), (7f64, 0)]);
+        mvalue.accumulate_statsd(smetric1).unwrap();
+        mvalue.accumulate_statsd(smetric2).unwrap();
+        mvalue.accumulate_statsd(smetric3).unwrap();
+
+        let expected = MetricValue::CustomHistogram(2, vec![(3f64, 0), (5f64, 1), (7f64, 1)]);
+        assert_eq!(mvalue, expected);
+    }
+
+    fn capnp_test_v1(metric: Metric<Float>) {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &metric.as_capnp_heap_v1()).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let reader = read_message(&mut cursor, capnp::message::DEFAULT_READER_OPTIONS).unwrap();
+        let reader = reader.get_root().unwrap();
+        let (_, rmetric) = Metric::<Float>::from_capnp_v1(reader).unwrap();
+        assert_eq!(rmetric, metric);
+    }
+
     fn capnp_test(metric: Metric<Float>) {
         let mut buf = Vec::new();
-        write_message(&mut buf, &metric.as_capnp_heap()).unwrap();
+        write_message(&mut buf, &metric.as_capnp_heap(None)).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
         let reader = read_message(&mut cursor, capnp::message::DEFAULT_READER_OPTIONS).unwrap();
         let reader = reader.get_root().unwrap();
@@ -379,37 +919,31 @@ mod tests {
     }
 
     #[test]
-    fn test_metric_capnp_counter() {
-        let mut metric1 = Metric::new(1f64, MetricType::Counter, Some(10), Some(0.1)).unwrap();
-        let metric2 = Metric::new(2f64, MetricType::Counter, None, None).unwrap();
+    fn test_metric_capnp_gauge() {
+        let mut metric1 = Metric::new(MetricValue::Gauge(1f64), Some(10));
+        let metric2 = Metric::new(MetricValue::Gauge(2f64), None);
+
         metric1.accumulate(metric2).unwrap();
+        capnp_test_v1(metric1.clone());
         capnp_test(metric1);
     }
 
     #[test]
-    fn test_metric_capnp_diffcounter() {
-        let mut metric1 = Metric::new(1f64, MetricType::DiffCounter(0.1f64), Some(20), Some(0.2)).unwrap();
-        let metric2 = Metric::new(1f64, MetricType::DiffCounter(0.5f64), None, None).unwrap();
+    fn test_metric_capnp_counter() {
+        let mut metric1 = Metric::new(MetricValue::Counter(1f64), Some(10));
+        let metric2 = Metric::new(MetricValue::Counter(2f64), None);
+
         metric1.accumulate(metric2).unwrap();
+        capnp_test_v1(metric1.clone());
         capnp_test(metric1);
     }
 
     #[test]
     fn test_metric_capnp_timer() {
-        let mut metric1 = Metric::new(1f64, MetricType::Timer(Vec::new()), Some(10), Some(0.1)).unwrap();
-        let metric2 = Metric::new(2f64, MetricType::Timer(vec![3f64]), None, None).unwrap();
+        let mut metric1 = Metric::new(MetricValue::Timer(vec![1f64, 2f64]), Some(10));
+        let metric2 = Metric::new(MetricValue::Timer(vec![3f64]), None);
         metric1.accumulate(metric2).unwrap();
-        assert!(if let MetricType::Timer(ref v) = metric1.mtype { v.len() == 3 } else { false });
-
-        capnp_test(metric1);
-    }
-
-    #[test]
-    fn test_metric_capnp_gauge() {
-        let mut metric1 = Metric::new(1f64, MetricType::Gauge(None), Some(10), Some(0.1)).unwrap();
-        let metric2 = Metric::new(2f64, MetricType::Gauge(Some(-1)), None, None).unwrap();
-        metric1.accumulate(metric2).unwrap();
-
+        capnp_test_v1(metric1.clone());
         capnp_test(metric1);
     }
 
@@ -417,12 +951,25 @@ mod tests {
     fn test_metric_capnp_set() {
         let mut set1 = HashSet::new();
         set1.extend(vec![10u64, 20u64, 10u64].into_iter());
-        let mut metric1 = Metric::new(1f64, MetricType::Set(set1), Some(10), Some(0.1)).unwrap();
+        let mut metric1 = Metric::new(MetricValue::Set(set1), Some(10));
+
         let mut set2 = HashSet::new();
         set2.extend(vec![10u64, 30u64].into_iter());
-        let metric2 = Metric::new(2f64, MetricType::Set(set2), None, None).unwrap();
+        let metric2 = Metric::new(MetricValue::Set(set2), None);
         metric1.accumulate(metric2).unwrap();
+        capnp_test_v1(metric1.clone());
+        capnp_test(metric1);
+    }
 
+    #[test]
+    fn test_metric_capnp_custom_histogram() {
+        let mvalue = MetricValue::CustomHistogram(1, vec![(3f64, 0), (5f64, 0), (7f64, 0)]);
+        let mut metric1 = Metric::new(mvalue, Some(10));
+
+        let mvalue = MetricValue::CustomHistogram(2, vec![(3f64, 1), (5f64, 1), (7f64, 0)]);
+        let metric2 = Metric::new(mvalue, None);
+        metric1.accumulate(metric2).unwrap();
+        capnp_test_v1(metric1.clone());
         capnp_test(metric1);
     }
 }

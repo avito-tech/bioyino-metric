@@ -3,7 +3,7 @@
 # This schema defines a way to deliver metrics in both ways:
 # as pre-aggregated shapshots and as new metrics
 # Please note, that capnproto allows to skip sending any fields
-# if they are separate types, so  there is almost no need to integrate
+# if they are separate types, so there is almost no need to integrate
 # option-like type into schema type system.
 # Bio will try to accept unspecified fields with some defaults,
 # but may fail if it cannot get ones it needs
@@ -59,8 +59,14 @@ struct MetricType {
         # set holds all values for further cardinality estimation
         set @4 :List(UInt64);
 
-        # someday we will support this... contributions are welcome if you need any of those or other ones
-        #   histogram @5 :...
+        # we count buckets using "right of or equal" rule
+        # example: 10 buckets in 0-10 range will look like
+        # c, (0, c0), (1, c1), ... (10, c10)
+        # where c0 will store number of values right of zero, including zero itself
+        # and left of 1 NOT including 1 itself
+        # the last bucket - c10 is catch-all bucket for all values >= 10
+        # and the first value c is the catch-all for all values < 0
+        customHistogram @5 :CustomHistogram;
     }
 }
 
@@ -84,4 +90,14 @@ struct Sampling  {
 struct Tag {
     key @0 :Text;
     value @1 :Text;
+}
+
+struct CustomHistogram {
+    leftBucket @0 :UInt64;
+    buckets @1 :List(RightOf);
+}
+
+struct RightOf {
+    value @0 :Float64;
+    counter @1 :UInt64;
 }

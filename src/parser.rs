@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::from_utf8;
@@ -17,7 +16,7 @@ use bytes::{Buf, BytesMut};
 use lexical_core::{parse as parse_number, FromLexical};
 use num_traits::{AsPrimitive, Float};
 
-use crate::metric::{FromF64, Metric, MetricType};
+use crate::metric::{FromF64, StatsdMetric, StatsdType};
 use crate::name::{sort_tags, MetricName, TagFormat};
 
 #[derive(Debug)]
@@ -25,7 +24,7 @@ pub enum ParsedPart<F>
 where
     F: Float + FromStr + Debug + AsPrimitive<f64>,
 {
-    Metric((PointerOffset<[u8]>, PointerOffset<[u8]>), Option<PointerOffset<[u8]>>, Metric<F>),
+    StatsdMetric((PointerOffset<[u8]>, PointerOffset<[u8]>), Option<PointerOffset<[u8]>>, StatsdMetric<F>),
     Trash(PointerOffset<[u8]>),
     TotalTrash(PointerOffset<[u8]>),
 }
@@ -52,7 +51,8 @@ where
     )
         .skip(byte(b':'))
         .and_then(move |(start, name, maybe_tag, stop)| {
-            //TODO: introduce metric name limits, use is.alphabetical for each unicode char
+            //TODO: maybe introduce metric name limits, use is.alphabetical for each unicode char,
+            // but put it under flag, like "strict" or something like that
             from_utf8(name).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("name part is not valid utf8"))?;
             let tag_pos = if let Some((_, tag_pos, tag)) = maybe_tag {
                 if tag.len() > max_tags_len {
@@ -70,26 +70,45 @@ where
 
     // This should parse metric value and separator
     let val = take_while1(|c: u8| c != b'|' && c != b'\n')
-        //
         .skip(byte(b'|'))
         .and_then(|value| parse_number::<F>(value).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("value is not a valid number")));
 
+    let regular_float = (
+        skip_many(byte(b'+').or(byte(b'-'))),
+        skip_many1(digit()),
+        optional((byte(b'.'), skip_many1(digit()))),
+        optional((byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit()))),
+    );
+
+    let histogram = (
+        byte(b'H'),
+        take_while1(|c: u8| c != b','), // we can avoid parsing the hole float here, only need the delimiter, skipping should be a bit faster
+        byte(b','),
+        recognize(regular_float), // but we cannot avoid it here because there is no symbol at the end, so we need to know exactly where the float ends
+    )
+        .and_then(|(_, start, _, end)| {
+            let start =
+                parse_number::<F>(start).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("custom histogram start value is not a valid number"))?;
+            let end =
+                parse_number::<F>(end).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("custom histgoram end value is not a valid number"))?;
+            Ok::<_, StreamErrorFor<I>>(StatsdType::CustomHistogram(start, end))
+        });
+
     // This parses metric type
     let mtype = parse_bytes(b"ms")
-        //
-        .map(|_| MetricType::Timer(Vec::<F>::new()))
-        .or(byte(b'g').map(|_| MetricType::Gauge(None)))
-        .or(byte(b'C').map(|_| MetricType::DiffCounter(F::zero())))
-        .or(byte(b'c').map(|_| MetricType::Counter))
-        .or(byte(b's').map(|_| MetricType::Set(HashSet::new())));
+        .map(|_| StatsdType::Timer)
+        .or(byte(b'g').map(|_| StatsdType::Gauge(None)))
+        .or(byte(b'c').map(|_| StatsdType::Counter))
+        .or(byte(b's').map(|_| StatsdType::Set))
+        .or(histogram);
 
-    let unsigned_float = skip_many1(digit())
-        //
-        .and(optional((byte(b'.'), skip_many1(digit()))))
-        .and(optional(
-            //
-            (byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit())),
-        ));
+    // sampling cannot be negative and we can check this at parser level by now allowing to
+    // parse the sign at the beginning
+    let unsigned_float = (
+        skip_many1(digit()),
+        optional((byte(b'.'), skip_many1(digit()))),
+        optional((byte(b'e'), optional(byte(b'+').or(byte(b'-'))), skip_many1(digit()))),
+    );
 
     let sampling = (parse_bytes(b"|@"), recognize(unsigned_float))
         .and_then(|(_, val)| parse_number::<F>(val).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("sampling value is not a valid number")));
@@ -98,16 +117,11 @@ where
         optional(sign),
         val,
         mtype,
-        choice((
-            sampling.map(Some),
-            skip_many(newline()).map(|_| None),
-            eof().map(|_| None),
-            //skip_many(newline()).map(|_| None),
-        )),
+        choice((sampling.map(Some), skip_many(newline()).map(|_| None), eof().map(|_| None))),
     )
-        .map(|(sign, mut val, mtype, sampling)| {
-            let mtype = if let MetricType::Gauge(_) = mtype {
-                MetricType::Gauge(sign)
+        .and_then(|(sign, mut val, mtype, sampling)| {
+            let mtype = if let StatsdType::Gauge(_) = mtype {
+                StatsdType::Gauge(sign)
             } else {
                 if sign == Some(-1) {
                     // get negative values back
@@ -116,13 +130,14 @@ where
                 mtype
             };
 
-            Metric::new(val, mtype, None, sampling).unwrap()
+            StatsdMetric::new(val, mtype, sampling).map_err(|_| StreamErrorFor::<I>::unexpected_static_message("bad metric values"))
         });
 
     // here's what we are trying to parse
     choice((
         // valid metric with (probably) tags
-        (skip_many(newline()), name_with_tags, metric, skip_many(newline())).map(|(_, (start, tag, stop), m, _)| ParsedPart::Metric((start, stop), tag, m)),
+        (skip_many(newline()), name_with_tags, metric, skip_many(newline()))
+            .map(|(_, (start, tag, stop), m, _)| ParsedPart::StatsdMetric((start, stop), tag, m)),
         (take_until_range(&b"\n"[..]), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::Trash(pos)),
         // trash not ending with \n, but too long to be metric
         (take(max_unparsed), skip_many(newline()), position()).map(|(_, _, pos)| ParsedPart::TotalTrash(pos)),
@@ -178,7 +193,7 @@ where
     F: Float + FromStr + AsPrimitive<f64> + FromF64 + Debug + FromLexical + Sync,
     <F as FromStr>::Err: std::error::Error + Sync + Send + 'static,
 {
-    type Item = (MetricName, Metric<F>);
+    type Item = (MetricName, StatsdMetric<F>);
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.skip >= self.input.len() {
@@ -203,7 +218,7 @@ where
                     // end the iteration to get the buffer filled
                     return None;
                 }
-                Ok((Some(ParsedPart::Metric(name_pos, tag_pos, metric)), consumed)) => {
+                Ok((Some(ParsedPart::StatsdMetric(name_pos, tag_pos, metric)), consumed)) => {
                     // at this point our input buffer looks like this
                     // [bad_data][useless_data][name][metric]
                     // we consider a metric name WITH tags as a "name" here
@@ -322,7 +337,6 @@ mod tests {
     use bytes::Bytes;
     // TODO: Questioned cases:
     //  * negative counters
-    //  * diff counters
 
     struct TestParseErrorHandler;
     impl ParseErrorHandler for TestParseErrorHandler {
@@ -346,7 +360,7 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1f64, MetricType::Counter, None, Some(1f64)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1f64, StatsdType::Counter, Some(1f64)).unwrap());
 
         assert_eq!(parser.next(), None);
     }
@@ -357,7 +371,29 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(12.65f64, MetricType::Counter, None, Some(1e-3f64)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(12.65f64, StatsdType::Counter, Some(1e-3f64)).unwrap());
+
+        assert_eq!(parser.next(), None);
+    }
+
+    #[test]
+    fn parse_metric_custom_histogram() {
+        let mut data = BytesMut::from(&b"gorets:1|H1,11|@1"[..]);
+        let mut parser = make_parser(&mut data);
+        let (name, metric) = parser.next().unwrap();
+        assert_eq!(&name.name[..], &b"gorets"[..]);
+        assert_eq!(
+            metric,
+            StatsdMetric::<f64>::new(1f64, StatsdType::CustomHistogram(1.0, 11.0), Some(1f64)).unwrap()
+        );
+
+        assert_eq!(parser.next(), None);
+
+        let mut data = BytesMut::from(&b"gorets:1|H0.1e1,110e-1"[..]);
+        let mut parser = make_parser(&mut data);
+        let (name, metric) = parser.next().unwrap();
+        assert_eq!(&name.name[..], &b"gorets"[..]);
+        assert_eq!(metric, StatsdMetric::<f64>::new(1f64, StatsdType::CustomHistogram(1.0, 11.0), None).unwrap());
 
         assert_eq!(parser.next(), None);
     }
@@ -368,11 +404,11 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"complex.bioyino.test1"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1e10f64, MetricType::Gauge(Some(-1)), None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1e10f64, StatsdType::Gauge(Some(-1)), None).unwrap());
 
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"complex.bioyino.test10"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1e10f64, MetricType::Gauge(Some(-1)), None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1e10f64, StatsdType::Gauge(Some(-1)), None).unwrap());
 
         assert_eq!(parser.next(), None);
     }
@@ -383,11 +419,11 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"complex.bioyino.test1"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1e10f64, MetricType::Gauge(Some(-1)), None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1e10f64, StatsdType::Gauge(Some(-1)), None).unwrap());
 
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"complex.bioyino.test10"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1e10f64, MetricType::Gauge(Some(-1)), None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1e10f64, StatsdType::Gauge(Some(-1)), None).unwrap());
 
         assert_eq!(parser.next(), None);
     }
@@ -398,10 +434,10 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, Some(0.0004)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(1)), Some(0.0004)).unwrap());
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(-1)), Some(0.5)).unwrap());
         assert_eq!(parser.next(), None);
     }
 
@@ -411,7 +447,7 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1f64, MetricType::Counter, None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1f64, StatsdType::Counter, None).unwrap());
         assert_eq!(parser.next(), None);
     }
 
@@ -421,10 +457,10 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(1)), None).unwrap());
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(-1)), Some(0.5)).unwrap());
         assert_eq!(parser.next(), None);
     }
 
@@ -442,7 +478,7 @@ mod tests {
 
         // Only one metric should be parsed
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(-1)), Some(0.5)).unwrap());
     }
 
     #[test]
@@ -454,10 +490,10 @@ mod tests {
         assert_eq!(&name.name[..], &b"gorets;a=b.j.k.l;c=d"[..]);
         assert_eq!(name.tag_pos, Some(6usize));
         assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";a=b.j.k.l;c=d"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(1)), None).unwrap());
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(-1)), Some(0.5)).unwrap());
     }
 
     #[test]
@@ -476,7 +512,7 @@ mod tests {
         assert_eq!(&name.name[..], &b"bobets;c=d"[..]);
         assert_eq!(name.tag_pos, Some(6usize));
         assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";c=d"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(None), None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(None), None).unwrap());
     }
 
     #[test]
@@ -487,14 +523,14 @@ mod tests {
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets1"[..]);
         assert_eq!(name.tag_pos, None);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(1)), None, None).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(1)), None).unwrap());
 
         // parser must sort tags
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets2;t2=fuck;tag3=sh.t"[..]);
         assert_eq!(name.tag_pos, Some(7usize));
         assert_eq!(&name.name[name.tag_pos.unwrap()..], &b";t2=fuck;tag3=sh.t"[..]);
-        assert_eq!(metric, Metric::<f64>::new(1000f64, MetricType::Gauge(Some(-1)), None, Some(0.5)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1000f64, StatsdType::Gauge(Some(-1)), Some(0.5)).unwrap());
     }
 
     #[test]
@@ -505,24 +541,15 @@ mod tests {
         let correct = vec![
             (
                 Bytes::from("gorets1"),
-                Metric::<f64>::new(1001f64, MetricType::Gauge(Some(1)), None, None).unwrap(),
+                StatsdMetric::<f64>::new(1001f64, StatsdType::Gauge(Some(1)), None).unwrap(),
             ),
-            (
-                Bytes::from("nuggets2"),
-                Metric::<f64>::new(-1002f64, MetricType::Set(HashSet::new()), None, Some(0.5)).unwrap(),
-            ),
+            (Bytes::from("nuggets2"), StatsdMetric::<f64>::new(-1002f64, StatsdType::Set, Some(0.5)).unwrap()),
             (
                 Bytes::from("gorets3"),
-                Metric::<f64>::new(1003f64, MetricType::Gauge(Some(1)), None, None).unwrap(),
+                StatsdMetric::<f64>::new(1003f64, StatsdType::Gauge(Some(1)), None).unwrap(),
             ),
-            (
-                Bytes::from("gorets4"),
-                Metric::<f64>::new(1004f64, MetricType::Timer(Vec::new()), None, None).unwrap(),
-            ),
-            (
-                Bytes::from("gorets5"),
-                Metric::<f64>::new(1005f64, MetricType::Timer(Vec::new()), None, None).unwrap(),
-            ),
+            (Bytes::from("gorets4"), StatsdMetric::<f64>::new(1004f64, StatsdType::Timer, None).unwrap()),
+            (Bytes::from("gorets5"), StatsdMetric::<f64>::new(1005f64, StatsdType::Timer, None).unwrap()),
         ];
         for i in 1..(data.len() + 1) {
             // this is out test case - partially received data
