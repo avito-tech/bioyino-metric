@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::metric::{FromF64, Metric, MetricTypeName, MetricValue};
 
-/// Percentile counter. Not safe agains all edge cases:
+/// Percentile counter. Not safe against all edge cases:
 ///
 /// * requires at least two elements in vector
 /// * vector MUST be sorted
@@ -74,7 +74,7 @@ where
     /// NOTE: aggretate value may not be set out of the box, i.e. when converted from string
     Rate(Option<F>),
 
-    /// The Nth percentile aggreegate, second value must match the oringinal value from config
+    /// The Nth percentile aggregate, second value must match the oringinal value from config
     /// for proper string conversion, see source code for more details
     // user will want the exact same number formatting of percentile like in config, but
     // float converstions from/to string may lose it, so
