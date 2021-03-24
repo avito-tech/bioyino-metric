@@ -228,23 +228,26 @@ where
     /// returns None in all inapplicable cases, like zero-length vector or metric type mismatch
     /// cached_sum must relate to the same metric between calls, giving incorrect results or
     /// panics otherwise
-    pub fn calculate(&self, metric: &Metric<F>, cached_sum: &mut Option<F>) -> Option<F> {
+    pub fn calculate(&self, metric: &Metric<F>, cached_sum: &mut Option<F>, timer_last: Option<F>) -> Option<F> {
         match (metric.value(), self) {
             // for sets calculate only count
-            (MetricValue::Set(ref hs), &Aggregate::Count) => Some(F::from_f64(hs.len() as f64)),
+            (MetricValue::Set(ref hs), &Aggregate::Count) => Some(F::from_f64(hs.len() as f64) / metric.sampling()),
             // don't count values for timers and sets
             (MetricValue::Set(_), &Aggregate::Value) => None,
             (MetricValue::Timer(_), &Aggregate::Value) => None,
             // for timers calculate all aggregates
             (MetricValue::Timer(ref agg), &s) => match s {
                 Aggregate::Value => None,
-                Aggregate::Count => Some(F::from_f64(agg.len() as f64)),
-                Aggregate::Last => agg.last().copied(),
+                Aggregate::Count => {
+                    let len = F::from_f64(agg.len() as f64);
+                    Some(len / metric.sampling())
+                }
+                Aggregate::Last => timer_last,
                 Aggregate::Min => Some(agg[0]),
                 Aggregate::Max => Some(agg[agg.len() - 1]),
                 Aggregate::Sum => {
                     fill_cached_sum(agg, cached_sum);
-                    cached_sum.map(|sum| sum)
+                    cached_sum.map(|sum| sum / metric.sampling())
                 }
                 Aggregate::Median => Some(percentile(agg, F::from_f64(0.5))),
                 Aggregate::Mean => {
@@ -252,18 +255,20 @@ where
                     // panic on division by zero to get incorrect usage from code to be explicit
                     fill_cached_sum(agg, cached_sum);
                     cached_sum.map(|sum| {
-                        let len: F = F::from_f64(agg.len() as f64);
+                        let len = F::from_f64(agg.len() as f64);
+                        // for mean we don't divide to sampling because len should be also divided
+                        // and this double division can be eliminated
                         sum / len
                     })
                 }
                 Aggregate::UpdateCount => Some(metric.updates()),
-                Aggregate::Rate(Some(r)) => Some(metric.updates() / r),
+                Aggregate::Rate(Some(secs)) => Some(metric.updates() / secs / metric.sampling()),
                 Aggregate::Rate(None) => None,
                 Aggregate::Percentile(ref p, _) => Some(percentile(agg, *p)),
                 Aggregate::Bucket(_) => None,
             },
             (MetricValue::CustomHistogram(left, buckets), &Aggregate::Bucket(Some(nth))) => {
-                if nth == 0 {
+                let value = if nth == 0 {
                     // index 0 corresponds for left bucket...
                     Some(F::from_f64(*left as f64))
                 } else if nth <= buckets.len() {
@@ -271,18 +276,20 @@ where
                     Some(F::from_f64(buckets[nth - 1].1 as f64))
                 } else {
                     None
-                }
+                };
+
+                value.map(|value| value / metric.sampling())
             }
             // Histogram + any other type except update and rate goes to last catch-all
             // buckets are exclusive for histograms
             (_, &Aggregate::Bucket(_)) => None,
-            // cout value for applicable types
+            // count value for applicable types
             (MetricValue::Gauge(v), &Aggregate::Value) => Some(*v),
-            (MetricValue::Counter(v), &Aggregate::Value) => Some(*v),
+            (MetricValue::Counter(v), &Aggregate::Value) => Some(*v / metric.sampling()),
 
             // for other types calculate only update counter
             (_, &Aggregate::UpdateCount) => Some(metric.updates()),
-            (_, &Aggregate::Rate(Some(r))) => Some(metric.updates() / r),
+            (_, &Aggregate::Rate(Some(secs))) => Some(metric.updates() / secs / metric.sampling()),
             _ => None,
         }
     }
@@ -297,6 +304,7 @@ where
 {
     metric: &'a Metric<F>,
     timer_sum: Option<F>,
+    timer_last: Option<F>,
     aggregates: &'a [Aggregate<F>],
     current: usize,
 }
@@ -306,16 +314,28 @@ where
     F: Float + Debug + FromF64 + AsPrimitive<f64> + AsPrimitive<usize>,
 {
     pub fn new(metric: &'a mut Metric<F>, aggregates: &'a [Aggregate<F>]) -> Self {
-        metric.sort_timer();
+        let timer_last = if let MetricValue::Timer(ref agg) = metric.value() {
+            if let Some(last) = agg.last() {
+                Some(*last)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let timer_sum = if let MetricValue::Timer(ref agg) = metric.value() {
             let first = agg.first().unwrap();
             Some(agg.iter().skip(1).fold(*first, |acc, &v| acc + v))
         } else {
             None
         };
+
+        metric.sort_timer();
         Self {
             metric,
             timer_sum,
+            timer_last,
             aggregates,
             current: 0,
         }
@@ -334,7 +354,9 @@ where
         }
 
         let agg = &self.aggregates[self.current];
-        let calc = agg.calculate(self.metric, &mut self.timer_sum).map(|result| (self.current, result));
+        let calc = agg
+            .calculate(self.metric, &mut self.timer_sum, self.timer_last)
+            .map(|result| (self.current, result));
         self.current += 1;
         Some(calc)
     }
@@ -437,9 +459,10 @@ mod tests {
     }
 
     impl TestData {
-        fn new() -> Self {
-            let seconds = 2.5f64;
+        fn new(sampling: f32) -> Self {
+            let seconds = 30f64;
             let samples = vec![12f64, 43f64, 1f64, 9f64, 84f64, 55f64, 31f64, 16f64, 64f64];
+            let sampling = sampling as f64;
             let num_samples = (samples.len()) as f64;
 
             Self {
@@ -449,7 +472,7 @@ mod tests {
                 to_aggregate: Vec::new(),
                 seconds,
                 buckets: 5,
-                rate: (num_samples + 1f64) / seconds,
+                rate: (num_samples + 1f64) / seconds / sampling,
                 rate_agg: Aggregate::Rate(Some(seconds)),
             }
         }
@@ -460,7 +483,19 @@ mod tests {
     // additional or missing aggregates
     fn test_aggregation(td: TestData) {
         // create aggregates list, this also tests all aggregates are parsed
-        let aggregates = vec!["count", "min", "updates", "max", "sum", "median", "rate", "percentile-85", "bucket"];
+        let aggregates = vec![
+            "count",
+            "min",
+            "updates",
+            "max",
+            "sum",
+            "median",
+            "rate",
+            "percentile-85",
+            "last",
+            "mean",
+            "bucket",
+        ];
         let mut aggregates = aggregates
             .into_iter()
             .map(|s| Aggregate::try_from(s.to_string()).unwrap())
@@ -472,13 +507,13 @@ mod tests {
         if let &mut Aggregate::Rate(ref mut r @ None) = &mut aggregates[6] {
             *r = Some(td.seconds)
         } else {
-            panic!("6th element must be rate, got {:?}", aggregates[6]);
+            panic!("6th element must be rate, got {:?}, check the test", aggregates[6]);
         }
 
         // buckets have to be added as separate aggregate each
         // we check the parsing first and pop the empty one
         if aggregates.pop() != Some(Aggregate::Bucket(None)) {
-            panic!("8th element must be empty bucket, check the test");
+            panic!("9th (last) element must be empty bucket, check the test");
         }
 
         // then push the required ones (+1 is for left bucket)
@@ -496,7 +531,7 @@ mod tests {
                 let mut calc_metric = metric.clone();
                 let calculator = AggregateCalculator::new(&mut calc_metric, &aggregates);
                 calculator
-                    //                    .inspect(|res| {
+                    //.inspect(|res| {
                     //dbg!(res);
                     //})
                     // count all of them that are countable (filtering None) and leaving the aggregate itself
@@ -529,30 +564,30 @@ mod tests {
             //dbg!(ec);
             let rv = results.get(ec).expect("expected key not found in results");
             assert_eq!(ev.len(), rv.len(), "have \n {:?} \n expect \n {:?}", ev, rv);
-            // for percentile a value can be a bit not equal
-            if ec == &Aggregate::Percentile(0.85f64, 85) {
-                ev.iter()
-                    .zip(rv.iter())
-                    .map(|((_, e), (_, r))| {
-                        let diff = (e - r).abs();
-                        assert!(diff < 0.0001, format!("{} ~= {}: {}", e, r, diff));
-                    })
-                    .last();
-            } else {
-                assert_eq!(ev, rv, "\non {:?}: \n {:?} \n not equal to \n {:?}", &ec, &ev, &rv);
-            }
+            // for percentile and a rate a value can be a bit not equal
+            //if ec == &Aggregate::Percentile(0.85f64, 85) || ec == &td.rate_agg {
+            ev.iter()
+                .zip(rv.iter())
+                .map(|((_, e), (_, r))| {
+                    let diff = (e - r).abs();
+                    assert!(diff < 0.0001, format!("(expected){} ~= {}: {}", e, r, diff));
+                })
+                .last();
+            //} else {
+            //assert_eq!(ev, rv, "\non {:?} expected: \n {:?} \n not equal to \n {:?}", &ec, &ev, &rv);
+            //}
         }
     }
 
     #[test]
     fn aggregate_gauge() {
-        let mut td = TestData::new();
+        let mut td = TestData::new(1.);
 
-        let mut gauge = Metric::new(MetricValue::Gauge(1f64), None);
+        let mut gauge = Metric::new(MetricValue::Gauge(1f64), None, 1.);
         td.samples
             .iter()
             .map(|t| {
-                let gauge2 = Metric::new(MetricValue::Gauge(*t as f64), None);
+                let gauge2 = Metric::new(MetricValue::Gauge(*t as f64), None, 1.);
                 gauge.accumulate(gauge2).unwrap();
             })
             .last();
@@ -568,16 +603,40 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_gauge_sampled() {
+        let mut td = TestData::new(0.1);
+
+        let mut gauge = Metric::new(MetricValue::Gauge(1f64), None, 0.1);
+        td.samples
+            .iter()
+            .map(|t| {
+                let gauge2 = Metric::new(MetricValue::Gauge(*t as f64), None, 0.1);
+                gauge.accumulate(gauge2).unwrap();
+            })
+            .last();
+
+        td.to_aggregate.push(gauge.clone());
+
+        let num_samples = td.samples.len() as f64;
+        // gauges only consider last value, but default aggregates still exist
+        td.expected.insert(Aggregate::Value, vec![(gauge.clone(), 64f64)]);
+        td.expected.insert(Aggregate::UpdateCount, vec![(gauge.clone(), num_samples + 1f64)]);
+        dbg!(td.rate);
+        td.expected.insert(td.rate_agg.clone(), vec![(gauge.clone(), td.rate)]);
+        test_aggregation(td);
+    }
+
+    #[test]
     fn aggregate_counter() {
-        let mut td = TestData::new();
+        let mut td = TestData::new(1.);
         // counters must be aggregated into 3 aggregates: value, update counter and rate
-        let mut counter = Metric::new(MetricValue::Counter(1f64), None);
+        let mut counter = Metric::new(MetricValue::Counter(1f64), None, 1.);
         let mut sign = 1f64;
         td.samples
             .iter()
             .map(|t| {
                 sign = -sign;
-                let counter2 = Metric::new(MetricValue::Counter(*t * sign), None);
+                let counter2 = Metric::new(MetricValue::Counter(*t * sign), None, 1.);
                 counter.accumulate(counter2).unwrap();
             })
             .last();
@@ -593,15 +652,40 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_counter_sampled() {
+        let mut td = TestData::new(0.1);
+        // counters must be aggregated into 3 aggregates: value, update counter and rate
+        let mut counter = Metric::new(MetricValue::Counter(1f64), None, 0.1);
+        let mut sign = 1f64;
+        td.samples
+            .iter()
+            .map(|t| {
+                sign = -sign;
+                let counter2 = Metric::new(MetricValue::Counter(*t * sign), None, 0.1);
+                counter.accumulate(counter2).unwrap();
+            })
+            .last();
+
+        td.to_aggregate.push(counter.clone());
+
+        // aggregated value for counter is a sum of all incoming data considering signs
+        td.expected.insert(Aggregate::Value, vec![(counter.clone(), -680f64)]);
+        td.expected.insert(Aggregate::UpdateCount, vec![(counter.clone(), td.num_samples + 1f64)]);
+        td.expected.insert(td.rate_agg.clone(), vec![(counter.clone(), td.rate)]);
+
+        test_aggregation(td);
+    }
+
+    #[test]
     fn aggregate_timer() {
-        let mut td = TestData::new();
+        let mut td = TestData::new(1.);
         // timers should be properly aggregated into all agregates except value
-        let mut timer = Metric::new(MetricValue::Timer(vec![1f64]), None);
+        let mut timer = Metric::new(MetricValue::Timer(vec![1f64]), None, 1.);
 
         td.samples
             .iter()
             .map(|t| {
-                let timer2 = Metric::new(MetricValue::Timer(vec![*t]), None);
+                let timer2 = Metric::new(MetricValue::Timer(vec![*t]), None, 1.);
                 timer.accumulate(timer2).unwrap();
             })
             .last();
@@ -615,6 +699,8 @@ mod tests {
         td.expected.insert(Aggregate::Median, vec![(timer.clone(), 23.5f64)]);
         td.expected.insert(td.rate_agg.clone(), vec![(timer.clone(), td.rate)]);
         td.expected.insert(Aggregate::Percentile(0.85, 85), vec![(timer.clone(), 60.85f64)]);
+        td.expected.insert(Aggregate::Mean, vec![(timer.clone(), 31.6f64)]);
+        td.expected.insert(Aggregate::Last, vec![(timer.clone(), 64f64)]);
 
         td.to_aggregate.push(timer);
 
@@ -622,19 +708,49 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_timer_sampled() {
+        let mut td = TestData::new(0.1);
+        // timers should be properly aggregated into all agregates except value
+        let mut timer = Metric::new(MetricValue::Timer(vec![1f64]), None, 0.1);
+
+        td.samples
+            .iter()
+            .map(|t| {
+                let timer2 = Metric::new(MetricValue::Timer(vec![*t]), None, 0.1);
+                timer.accumulate(timer2).unwrap();
+            })
+            .last();
+
+        td.expected.insert(Aggregate::Count, vec![(timer.clone(), 100f64)]);
+        td.expected.insert(Aggregate::Min, vec![(timer.clone(), 1f64)]);
+        td.expected.insert(Aggregate::UpdateCount, vec![(timer.clone(), td.num_samples + 1f64)]);
+        td.expected.insert(Aggregate::Max, vec![(timer.clone(), 84f64)]);
+        td.expected.insert(Aggregate::Sum, vec![(timer.clone(), 3160f64)]);
+        // percentiles( 0.5 and 0.85 ) were counted in google spreadsheets
+        td.expected.insert(Aggregate::Median, vec![(timer.clone(), 23.5f64)]);
+        td.expected.insert(td.rate_agg.clone(), vec![(timer.clone(), td.rate)]);
+        td.expected.insert(Aggregate::Percentile(0.85, 85), vec![(timer.clone(), 60.85f64)]);
+        td.expected.insert(Aggregate::Mean, vec![(timer.clone(), 31.6f64)]);
+        td.expected.insert(Aggregate::Last, vec![(timer.clone(), 64f64)]);
+
+        td.to_aggregate.push(timer);
+
+        test_aggregation(td);
+    }
+    #[test]
     fn aggregate_set() {
-        let mut td = TestData::new();
+        let mut td = TestData::new(1.);
         // sets should be properly aggregated into count of uniques and update count
         let mut hs = HashSet::new();
         hs.insert(1f64.to_bits());
-        let mut set = Metric::new(MetricValue::Set(hs), None);
+        let mut set = Metric::new(MetricValue::Set(hs), None, 1.);
 
         td.samples
             .iter()
             .map(|t| {
                 let mut hs = HashSet::new();
                 hs.insert((*t).to_bits());
-                let set2 = Metric::new(MetricValue::Set(hs), None);
+                let set2 = Metric::new(MetricValue::Set(hs), None, 1.);
                 set.accumulate(set2).unwrap();
             })
             .last();
@@ -645,10 +761,34 @@ mod tests {
         td.to_aggregate.push(set);
         test_aggregation(td);
     }
+    #[test]
+    fn aggregate_set_sampled() {
+        let mut td = TestData::new(0.1);
+        // sets should be properly aggregated into count of uniques and update count
+        let mut hs = HashSet::new();
+        hs.insert(1f64.to_bits());
+        let mut set = Metric::new(MetricValue::Set(hs), None, 0.1);
+
+        td.samples
+            .iter()
+            .map(|t| {
+                let mut hs = HashSet::new();
+                hs.insert((*t).to_bits());
+                let set2 = Metric::new(MetricValue::Set(hs), None, 0.1);
+                set.accumulate(set2).unwrap();
+            })
+            .last();
+
+        td.expected.insert(Aggregate::Count, vec![(set.clone(), 90f64)]);
+        td.expected.insert(Aggregate::UpdateCount, vec![(set.clone(), 10f64)]);
+        td.expected.insert(td.rate_agg.clone(), vec![(set.clone(), td.rate)]);
+        td.to_aggregate.push(set);
+        test_aggregation(td);
+    }
 
     #[test]
     fn aggregate_histogram() {
-        let mut td = TestData::new();
+        let mut td = TestData::new(1.);
         // histograms should be properly aggregated into a number of buckets
         // as well as update_count and rate
         let smetric = StatsdMetric::new(-1f64, StatsdType::CustomHistogram(0f64, 100f64), None).unwrap();
@@ -671,6 +811,40 @@ mod tests {
         td.expected.insert(Aggregate::Bucket(Some(2)), vec![(histogram.clone(), 2f64)]); // 25..50
         td.expected.insert(Aggregate::Bucket(Some(3)), vec![(histogram.clone(), 2f64)]); // 50..75
         td.expected.insert(Aggregate::Bucket(Some(4)), vec![(histogram.clone(), 1f64)]); // 75..100
+        td.expected.insert(Aggregate::Bucket(Some(5)), vec![(histogram.clone(), 0f64)]); // 100..inf
+        td.expected.insert(Aggregate::UpdateCount, vec![(histogram.clone(), 10f64)]);
+        td.expected.insert(td.rate_agg.clone(), vec![(histogram.clone(), td.rate)]);
+        td.to_aggregate.push(histogram);
+
+        test_aggregation(td);
+    }
+
+    #[test]
+    fn aggregate_histogram_sampled() {
+        let mut td = TestData::new(0.1);
+        // histograms should be properly aggregated into a number of buckets
+        // as well as update_count and rate
+        let smetric = StatsdMetric::new(-1f64, StatsdType::CustomHistogram(0f64, 100f64), Some(0.1)).unwrap();
+        // for this request and 5 buckets, the buckets will be
+        // 0, 25, 50, 75, 100
+
+        let mut histogram = Metric::from_statsd(&smetric, td.buckets, None).unwrap();
+
+        //let samples = vec![12f64, 43f64, 1f64, 9f64, 84f64, 55f64, 31f64, 16f64, 64f64];
+        td.samples
+            .iter()
+            .map(|t| {
+                let smetric = StatsdMetric::new(*t, StatsdType::CustomHistogram(0f64, 100f64), Some(0.1)).unwrap();
+                histogram.accumulate_statsd(smetric).unwrap();
+            })
+            .last();
+
+        // because of sampling, all buckets must be ten times bigger
+        td.expected.insert(Aggregate::Bucket(Some(0)), vec![(histogram.clone(), 10f64)]); // -inf..0
+        td.expected.insert(Aggregate::Bucket(Some(1)), vec![(histogram.clone(), 40f64)]); // 0..25
+        td.expected.insert(Aggregate::Bucket(Some(2)), vec![(histogram.clone(), 20f64)]); // 25..50
+        td.expected.insert(Aggregate::Bucket(Some(3)), vec![(histogram.clone(), 20f64)]); // 50..75
+        td.expected.insert(Aggregate::Bucket(Some(4)), vec![(histogram.clone(), 10f64)]); // 75..100
         td.expected.insert(Aggregate::Bucket(Some(5)), vec![(histogram.clone(), 0f64)]); // 100..inf
         td.expected.insert(Aggregate::UpdateCount, vec![(histogram.clone(), 10f64)]);
         td.expected.insert(td.rate_agg.clone(), vec![(histogram.clone(), td.rate)]);

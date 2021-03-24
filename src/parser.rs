@@ -111,7 +111,7 @@ where
     );
 
     let sampling = (parse_bytes(b"|@"), recognize(unsigned_float))
-        .and_then(|(_, val)| parse_number::<F>(val).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("sampling value is not a valid number")));
+        .and_then(|(_, val)| parse_number::<f32>(val).map_err(|_e| StreamErrorFor::<I>::unexpected_static_message("sampling value is not a valid number")));
 
     let metric = (
         optional(sign),
@@ -318,7 +318,7 @@ where
                             Some(pos) => self.input.advance(pos),
                             None => self.input.clear(),
                         }
-                    //cut all the input otherwise
+                        //cut all the input otherwise
                     } else {
                         // cut buffer to position where error was found
                         self.skip = 0;
@@ -360,7 +360,7 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, StatsdMetric::<f64>::new(1f64, StatsdType::Counter, Some(1f64)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(1f64, StatsdType::Counter, Some(1f32)).unwrap());
 
         assert_eq!(parser.next(), None);
     }
@@ -371,7 +371,7 @@ mod tests {
         let mut parser = make_parser(&mut data);
         let (name, metric) = parser.next().unwrap();
         assert_eq!(&name.name[..], &b"gorets"[..]);
-        assert_eq!(metric, StatsdMetric::<f64>::new(12.65f64, StatsdType::Counter, Some(1e-3f64)).unwrap());
+        assert_eq!(metric, StatsdMetric::<f64>::new(12.65f64, StatsdType::Counter, Some(1e-3f32)).unwrap());
 
         assert_eq!(parser.next(), None);
     }
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(&name.name[..], &b"gorets"[..]);
         assert_eq!(
             metric,
-            StatsdMetric::<f64>::new(1f64, StatsdType::CustomHistogram(1.0, 11.0), Some(1f64)).unwrap()
+            StatsdMetric::<f64>::new(1f64, StatsdType::CustomHistogram(1.0, 11.0), Some(1f32)).unwrap()
         );
 
         assert_eq!(parser.next(), None);

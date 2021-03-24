@@ -62,10 +62,12 @@ struct Metric {
         struct CustomHistogram {
             leftBucket @0 :UInt64;
             buckets @1 :List(RightOf);
+
             struct RightOf {
                 value @0 :Float64;
                 counter @1 :UInt64;
             }
+
         }
     }
 
@@ -77,8 +79,10 @@ struct Metric {
         ts @0 :UInt64;
     }
 
+    sampling @3 :Float32;
+
     # any other useful data about metric
-    meta @3 :MetricMeta;
+    meta @4 :MetricMeta;
 
     struct MetricMeta {
         updateCounter @0 :UInt32;
