@@ -42,12 +42,16 @@ pub enum MetricError {
 
     #[error("unknown type name '{}'", _0)]
     BadTypeName(String),
+
+    #[error("unknown protocol version '{}'", _0)]
+    BadProtoVersion(String),
 }
 
 #[derive(Debug, PartialEq)]
 /// This is the "view" of a metric coming from statsd as input.
 ///
 /// While the types are same, it is different from the way it is represented internally
+#[derive(Clone)]
 pub enum StatsdType<F>
 where
     F: Debug,
@@ -80,7 +84,7 @@ impl FromF64 for f32 {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct StatsdMetric<F>
 where
     F: Debug,
@@ -747,6 +751,19 @@ impl MetricTypeName {
             MetricValue::CustomHistogram(_, _) => MetricTypeName::CustomHistogram,
         }
     }
+
+    pub fn from_statsd_metric<F>(m: &StatsdMetric<F>) -> Self
+    where
+        F: Copy + PartialEq + Debug + Float + FromF64 + AsPrimitive<f64>,
+    {
+        match m.mtype {
+            StatsdType::Counter => MetricTypeName::Counter,
+            StatsdType::Timer => MetricTypeName::Timer,
+            StatsdType::Gauge(_) => MetricTypeName::Gauge,
+            StatsdType::Set => MetricTypeName::Set,
+            StatsdType::CustomHistogram(_, _) => MetricTypeName::CustomHistogram,
+        }
+    }
 }
 
 impl TryFrom<&str> for MetricTypeName {
@@ -776,6 +793,28 @@ impl ToString for MetricTypeName {
             MetricTypeName::CustomHistogram => "custom-histogram",
         }
         .to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "&str")]
+pub enum ProtocolVersion {
+    V1,
+    V2,
+}
+
+impl TryFrom<&str> for ProtocolVersion {
+    type Error = MetricError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "1" => Ok(ProtocolVersion::V1),
+            "v1" => Ok(ProtocolVersion::V1),
+            "2" => Ok(ProtocolVersion::V2),
+            "v2" => Ok(ProtocolVersion::V2),
+            _ => Err(MetricError::BadTypeName(s.to_string())),
+        }
     }
 }
 
