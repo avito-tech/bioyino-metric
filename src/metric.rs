@@ -4,7 +4,6 @@ use std::convert::TryFrom;
 use std::fmt::Debug;
 
 use bytes::Bytes;
-use capnp;
 use capnp::message::{Allocator, Builder, HeapAllocator};
 use num_traits::{AsPrimitive, Float};
 use serde::{Deserialize, Serialize};
@@ -163,7 +162,7 @@ where
                 // sender know it returning error
                 // as of now we prefer observability at the cost of small(intuitive assumption) performance loss
                 // in some future we may change this to an option or even better: a compile-time flag
-                if buckets1.len() > 0 && buckets2.len() > 0 && buckets1[0].0 != buckets2[0].0 {
+                if !buckets1.is_empty() && !buckets2.is_empty() && buckets1[0].0 != buckets2[0].0 {
                     return Err(MetricError::CustomHistrogramRange);
                 }
 
@@ -230,9 +229,7 @@ where
                 }
                 Ok(())
             }
-            (_, _) => {
-                return Err(MetricError::Aggregating);
-            }
+            (_, _) => Err(MetricError::Aggregating),
         }
     }
 
@@ -257,7 +254,7 @@ where
                         let value: f64 = (*value).as_();
                         timer_builder.set(idx as u32, value);
                     })
-                    .last();
+                .last();
                 0f64
             }
             MetricValue::Set(ref v) => {
@@ -267,7 +264,7 @@ where
                     .map(|(idx, value)| {
                         sebuilder.set(idx as u32, *value);
                     })
-                    .last();
+                .last();
                 0f64
             }
             MetricValue::CustomHistogram(left, ref buckets) => {
@@ -282,7 +279,7 @@ where
                         single_bucket.set_value(boundary.as_());
                         single_bucket.set_counter(*counter);
                     })
-                    .last();
+                .last();
                 0f64
             }
         }
@@ -300,8 +297,8 @@ where
                         let value: f64 = (*value).as_();
                         timer_values.set(idx as u32, value);
                     })
-                    .last();
-            }
+                .last();
+                }
             MetricValue::Set(ref v) => {
                 let mut set_builder = builder.reborrow().init_set(v.len() as u32);
                 v.iter()
@@ -309,8 +306,8 @@ where
                     .map(|(idx, value)| {
                         set_builder.set(idx as u32, *value);
                     })
-                    .last();
-            }
+                .last();
+                }
             MetricValue::CustomHistogram(left, ref buckets) => {
                 let mut h_builder = builder.reborrow().init_custom_histogram();
                 h_builder.set_left_bucket(*left);
@@ -323,8 +320,8 @@ where
                         single_bucket.set_value(boundary.as_());
                         single_bucket.set_counter(*counter);
                     })
-                    .last();
-            }
+                .last();
+                }
         };
     }
 
@@ -445,8 +442,7 @@ where
             }
             StatsdType::Counter => Ok(MetricValue::Counter(m.value)),
             StatsdType::Timer => {
-                let mut mv = Vec::with_capacity(1);
-                mv.push(m.value);
+                let mv = vec![m.value];
                 Ok(MetricValue::Timer(mv))
             }
             StatsdType::Set => {
@@ -524,7 +520,7 @@ where
             sampling,
         } = other;
         self.update_counter += update_counter;
-        if sampling != other.sampling {
+        if (sampling - other.sampling).abs() > f32::EPSILON {
             return Err(MetricError::Sampling);
         }
         self.timestamp = match (self.timestamp, timestamp) {
@@ -545,7 +541,7 @@ where
     pub fn accumulate_statsd(&mut self, statsd: StatsdMetric<F>) -> Result<(), MetricError> {
         self.update_counter += 1;
 
-        if self.sampling != convert_sampling(&statsd.sampling) {
+        if (self.sampling - convert_sampling(&statsd.sampling)).abs() > f32::EPSILON {
             return Err(MetricError::Sampling);
         }
 
@@ -636,7 +632,7 @@ where
         let mut m_builder = builder.reborrow().init_meta();
 
         m_builder.set_update_counter(self.update_counter);
-        if self.sampling != 1f32 {
+        if (self.sampling - 1f32).abs() > f32::EPSILON {
             m_builder.init_sampling().set_sampling(self.sampling);
         }
     }
@@ -720,8 +716,7 @@ where
     /// builds a complete capnp structure
     pub fn as_capnp_heap(&self, name: Option<(&MetricName, bool)>) -> Builder<HeapAllocator> {
         let allocator = HeapAllocator::new();
-        let builder = self.as_capnp(allocator, name);
-        builder
+        self.as_capnp(allocator, name)
     }
 }
 
@@ -821,8 +816,8 @@ impl TryFrom<&str> for ProtocolVersion {
 impl ProtocolVersion {
     pub fn id(&self) -> u64 {
         match self {
-            &ProtocolVersion::V1 => 0,
-            &ProtocolVersion::V2 => V2ID,
+            ProtocolVersion::V1 => 0,
+            ProtocolVersion::V2 => V2ID,
         }
     }
 }

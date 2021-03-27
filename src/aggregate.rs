@@ -171,7 +171,7 @@ where
             Aggregate::Rate(ref r) => {
                 9usize.hash(state);
                 // we hash F as integer decoded value
-                r.map(|f| Float::integer_decode(f)).hash(state);
+                r.map(Float::integer_decode).hash(state);
             }
             // we need this for hashing and comparison, so we just use a value different from other
             // enum values
@@ -375,16 +375,16 @@ where
     map.insert(
         MetricTypeName::Timer,
         vec![
-            Aggregate::Count,
-            Aggregate::Last,
-            Aggregate::Min,
-            Aggregate::Max,
-            Aggregate::Sum,
-            Aggregate::Median,
-            Aggregate::Mean,
-            Aggregate::UpdateCount,
-            Aggregate::Rate(interval),
-            Aggregate::Percentile(F::from_f64(0.99), 99),
+        Aggregate::Count,
+        Aggregate::Last,
+        Aggregate::Min,
+        Aggregate::Max,
+        Aggregate::Sum,
+        Aggregate::Median,
+        Aggregate::Mean,
+        Aggregate::UpdateCount,
+        Aggregate::Rate(interval),
+        Aggregate::Percentile(F::from_f64(0.99), 99),
         ],
     );
     if let Some(num) = buckets {
@@ -545,9 +545,9 @@ mod tests {
                         }
                         results.get_mut(&aggregates[idx]).unwrap().push((metric.clone(), value));
                     })
-                    .last();
-            })
-            .last();
+                .last();
+                })
+        .last();
 
         //dbg!(&expected, &results);
         if td.expected.len() != results.len() {
@@ -570,13 +570,13 @@ mod tests {
                 .zip(rv.iter())
                 .map(|((_, e), (_, r))| {
                     let diff = (e - r).abs();
-                    assert!(diff < 0.0001, format!("(expected){} ~= {}: {}", e, r, diff));
+                    assert!(diff < 0.0001, "(expected){} ~= {}: {}", e, r, diff);
                 })
-                .last();
+            .last();
             //} else {
             //assert_eq!(ev, rv, "\non {:?} expected: \n {:?} \n not equal to \n {:?}", &ec, &ev, &rv);
             //}
-        }
+            }
     }
 
     #[test]
@@ -590,7 +590,7 @@ mod tests {
                 let gauge2 = Metric::new(MetricValue::Gauge(*t as f64), None, 1.);
                 gauge.accumulate(gauge2).unwrap();
             })
-            .last();
+        .last();
 
         td.to_aggregate.push(gauge.clone());
 
@@ -613,7 +613,7 @@ mod tests {
                 let gauge2 = Metric::new(MetricValue::Gauge(*t as f64), None, 0.1);
                 gauge.accumulate(gauge2).unwrap();
             })
-            .last();
+        .last();
 
         td.to_aggregate.push(gauge.clone());
 
@@ -639,7 +639,7 @@ mod tests {
                 let counter2 = Metric::new(MetricValue::Counter(*t * sign), None, 1.);
                 counter.accumulate(counter2).unwrap();
             })
-            .last();
+        .last();
 
         td.to_aggregate.push(counter.clone());
 
@@ -664,7 +664,7 @@ mod tests {
                 let counter2 = Metric::new(MetricValue::Counter(*t * sign), None, 0.1);
                 counter.accumulate(counter2).unwrap();
             })
-            .last();
+        .last();
 
         td.to_aggregate.push(counter.clone());
 
@@ -688,7 +688,7 @@ mod tests {
                 let timer2 = Metric::new(MetricValue::Timer(vec![*t]), None, 1.);
                 timer.accumulate(timer2).unwrap();
             })
-            .last();
+        .last();
 
         td.expected.insert(Aggregate::Count, vec![(timer.clone(), 10f64)]);
         td.expected.insert(Aggregate::Min, vec![(timer.clone(), 1f64)]);
@@ -719,7 +719,7 @@ mod tests {
                 let timer2 = Metric::new(MetricValue::Timer(vec![*t]), None, 0.1);
                 timer.accumulate(timer2).unwrap();
             })
-            .last();
+        .last();
 
         td.expected.insert(Aggregate::Count, vec![(timer.clone(), 100f64)]);
         td.expected.insert(Aggregate::Min, vec![(timer.clone(), 1f64)]);
@@ -753,7 +753,7 @@ mod tests {
                 let set2 = Metric::new(MetricValue::Set(hs), None, 1.);
                 set.accumulate(set2).unwrap();
             })
-            .last();
+        .last();
 
         td.expected.insert(Aggregate::Count, vec![(set.clone(), 9f64)]);
         td.expected.insert(Aggregate::UpdateCount, vec![(set.clone(), 10f64)]);
@@ -777,7 +777,7 @@ mod tests {
                 let set2 = Metric::new(MetricValue::Set(hs), None, 0.1);
                 set.accumulate(set2).unwrap();
             })
-            .last();
+        .last();
 
         td.expected.insert(Aggregate::Count, vec![(set.clone(), 90f64)]);
         td.expected.insert(Aggregate::UpdateCount, vec![(set.clone(), 10f64)]);
@@ -804,7 +804,7 @@ mod tests {
                 let smetric = StatsdMetric::new(*t, StatsdType::CustomHistogram(0f64, 100f64), None).unwrap();
                 histogram.accumulate_statsd(smetric).unwrap();
             })
-            .last();
+        .last();
 
         td.expected.insert(Aggregate::Bucket(Some(0)), vec![(histogram.clone(), 1f64)]); // -inf..0
         td.expected.insert(Aggregate::Bucket(Some(1)), vec![(histogram.clone(), 4f64)]); // 0..25
@@ -837,7 +837,7 @@ mod tests {
                 let smetric = StatsdMetric::new(*t, StatsdType::CustomHistogram(0f64, 100f64), Some(0.1)).unwrap();
                 histogram.accumulate_statsd(smetric).unwrap();
             })
-            .last();
+        .last();
 
         // because of sampling, all buckets must be ten times bigger
         td.expected.insert(Aggregate::Bucket(Some(0)), vec![(histogram.clone(), 10f64)]); // -inf..0
