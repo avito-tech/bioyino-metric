@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::name::{find_tag_pos, MetricName, TagFormat};
 use crate::protocol_capnp::{gauge as gauge_v1, metric as cmetric_v1, metric_type};
-use crate::protocol_v2_capnp::{metric as cmetric, metric::metric_meta::tags, metric::metric_value};
+use crate::protocol_v2_capnp::{metric as cmetric, metric::metric_meta::tags, metric::metric_value, ID as V2ID};
 
 #[derive(Error, Debug)]
 pub enum MetricError {
@@ -814,6 +814,15 @@ impl TryFrom<&str> for ProtocolVersion {
             "2" => Ok(ProtocolVersion::V2),
             "v2" => Ok(ProtocolVersion::V2),
             _ => Err(MetricError::BadTypeName(s.to_string())),
+        }
+    }
+}
+
+impl ProtocolVersion {
+    pub fn id(&self) -> u64 {
+        match self {
+            &ProtocolVersion::V1 => 0,
+            &ProtocolVersion::V2 => V2ID,
         }
     }
 }

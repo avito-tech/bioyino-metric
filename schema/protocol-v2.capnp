@@ -12,14 +12,18 @@
 # if they are separate types, so there is no need to integrate
 # option-like type into schema type system.
 
+const id :UInt64 = 0xdbb9ad1f14bf0b36;
 struct Message {
+    # MUST be always equal to 2 for this protocol to be parsed correctly
+    version @0 :UInt64;
+
     # we want to keep this type extensible, and avoid the limitations for all new types in union
     # as capnproto specification requires
     # to make it a union out of the box, we introduce the noop message, wich can be used for
     # ping purpose or anything else
     union {
-        noop @0 :Void;
-        snapshot @1 :List(Metric);
+        noop @1 :Void;
+        snapshot @2 :List(Metric);
     }
 }
 
