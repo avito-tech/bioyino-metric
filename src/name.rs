@@ -225,18 +225,22 @@ impl MetricName {
         buf.reserve(addlen + 1); // 1 is for `;`
         match self.tag_pos {
             None => {
+                // easy case: no tags
                 if !only_tag {
                     buf.put_slice(&self.name);
                 }
-                // easy case: no tags
-                if self.name[namelen - 1] != b';' {
-                    buf.put_u8(b';');
-                }
 
-                if !tag_name.is_empty() {
-                    buf.put_slice(tag_name);
-                    buf.put_u8(b'=');
-                    buf.put_slice(tag);
+                // special case: tag name and value is empty: do nothing
+                if !tag_name.is_empty() || !tag.is_empty() {
+                    if self.name[namelen - 1] != b';' {
+                        buf.put_u8(b';');
+                    }
+
+                    if !tag_name.is_empty() {
+                        buf.put_slice(tag_name);
+                        buf.put_u8(b'=');
+                        buf.put_slice(tag);
+                    }
                 }
             }
             Some(pos) => {
@@ -650,6 +654,14 @@ mod tests {
             &b"counts.gorets.bobez.count"[..],
             "postfix and prefix are placed properly in smart mode",
         );
+
+        let mut mopts = opts.clone();
+        let mut nopts = default_options(b"");
+        nopts.destination = AggregationDestination::Tag;
+        nopts.tag = Bytes::new();
+        mopts.insert((timer, Aggregate::Value), nopts);
+        without_tags.put_with_options(&mut buf, typename, Aggregate::Value, &mopts).unwrap();
+        assert_buf(&mut buf, &b"gorets.bobez"[..], "semicolon not added in tag mode");
 
         without_tags
             .put_with_options(&mut buf, typename, Aggregate::Percentile(0.8f64, 80), &opts)
