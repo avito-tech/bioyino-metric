@@ -55,32 +55,27 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
             }
 
             let mut offset = 0; // meaningful length of data in intermediate buffer
-            let mut cutlen = 0; // length to cut from name because of removed empty tags
             for part in name.split(|c| *c == b';').skip(1).sorted() {
                 if part.is_empty() {
-                    //   offset += 1;
-                    cutlen += 1;
-                } else {
-                    let end = offset + part.len();
-                    intermediate[offset..end].copy_from_slice(part);
-                    if end < intermediate.len() - 1 {
-                        intermediate[end] = b';';
-                    }
+                    continue;
+                }
+
+                let end = offset + part.len();
+                intermediate[offset..end].copy_from_slice(part);
+                if end < intermediate.len() {
+                    // only add ; if there is space for it
+                    intermediate[end] = b';';
                     offset = end + 1;
                 }
             }
 
-            let newlen = if intermediate[offset] == b';' {
+            // remove trailing semicolons
+            while offset > 0 && intermediate[offset - 1] == b';' {
                 offset -= 1;
-                name.len() - cutlen - 1
-            } else {
-                name.len() - cutlen
-            };
-
-            if offset > 0 {
-                offset -= 1;
-                name[tag_pos + 1..newlen].copy_from_slice(&intermediate[..offset]);
             }
+
+            let newlen = tag_pos + 1 + offset;
+            name[tag_pos + 1..newlen].copy_from_slice(&intermediate[..offset]);
 
             Ok(newlen)
         }
@@ -353,7 +348,7 @@ impl MetricName {
     /// Corner cases:
     /// * does not put tag if tag name is empty, puts it if value is empty though
     /// * does not consider (probably expected) defaults, like not putting postfix or tag_value for Aggregate::Value;
-    /// this beaviour must be exlpicitly specified in options with prefix = "" and/or tag_name = "".
+    /// this beaviour must be explicitly specified in options with prefix = "" and/or tag_name = "".
     #[allow(clippy::unit_arg)]
     pub fn put_with_options<F>(
         &self,
@@ -747,11 +742,35 @@ mod tests {
 
     #[test]
     fn metric_name_sort_tags_graphite() {
-        let mut name = BytesMut::from(&b"gorets2;tag3=shit;t2=fuck"[..]);
         let mode = TagFormat::Graphite;
 
         let mut intermediate: Vec<u8> = Vec::new();
-        intermediate.resize(name.len(), 0u8);
+        let x = b"12345678";
+        let y = b"abcdefgh";
+        for i in 2..x.len() {
+            for j in 2..y.len() {
+                let mut name = BytesMut::from(&b"test_corrupted_tags;y="[..]);
+                name.extend_from_slice(&y[..j + 1]);
+                name.extend_from_slice(&b";x="[..]);
+                name.extend_from_slice(&x[..i + 1]);
+                intermediate.resize(name.len(), b'z');
+                let tag_pos = find_tag_pos(&name, mode).unwrap();
+
+                let newlen = sort_tags(&mut name[..], mode, &mut intermediate, tag_pos).unwrap();
+
+                let mut expected = BytesMut::from(&b"test_corrupted_tags;x="[..]);
+                expected.extend_from_slice(&x[..i + 1]);
+                expected.extend_from_slice(&b";y="[..]);
+                expected.extend_from_slice(&y[..j + 1]);
+
+                assert_buf(&mut BytesMut::from(&name[..newlen]), &expected[..], "sorting does not miss last byte");
+            }
+        }
+
+        let mut name = BytesMut::from(&b"gorets2;tag3=shit;t2=fuck"[..]);
+
+        let mut intermediate: Vec<u8> = Vec::new();
+        intermediate.resize(name.len(), b'z');
 
         let tag_pos = find_tag_pos(&name, mode).unwrap();
 
