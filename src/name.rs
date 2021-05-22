@@ -39,10 +39,6 @@ pub fn find_tag_pos(name: &[u8], mode: TagFormat) -> Option<usize> {
 
 /// Sorts tags inside name using intermediate buffer
 pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8], tag_pos: usize) -> Result<usize, ()> {
-    if intermediate.len() < (name.len() - tag_pos) {
-        return Err(());
-    }
-
     use lazysort::Sorted;
     match mode {
         TagFormat::Graphite => {
@@ -54,6 +50,10 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
                 return Ok(name.len());
             }
 
+            if intermediate.len() < (name.len() - tag_pos - 1) {
+                return Err(());
+            }
+
             let mut offset = 0; // meaningful length of data in intermediate buffer
             for part in name.split(|c| *c == b';').skip(1).sorted() {
                 if part.is_empty() {
@@ -62,15 +62,20 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
 
                 let end = offset + part.len();
                 intermediate[offset..end].copy_from_slice(part);
+                // add a trailing semicolon, if it is not an end of the buffer
                 if end < intermediate.len() {
-                    // only add ; if there is space for it
                     intermediate[end] = b';';
-                    offset = end + 1;
                 }
+                // anyways, set the offset to the next position
+                //
+                // in case of last part and precise length of the intermediate
+                // this will be next byte after intermediate boundary
+                // this byte will never be read and will be decreased right away
+                offset = end + 1;
             }
 
-            // remove trailing semicolons
-            while offset > 0 && intermediate[offset - 1] == b';' {
+            // remove trailing semicolon, if any was added
+            if offset > 0 {
                 offset -= 1;
             }
 
@@ -770,11 +775,16 @@ mod tests {
         let mut name = BytesMut::from(&b"gorets2;tag3=shit;t2=fuck"[..]);
 
         let mut intermediate: Vec<u8> = Vec::new();
-        intermediate.resize(name.len(), b'z');
 
         let tag_pos = find_tag_pos(&name, mode).unwrap();
-
-        assert!(sort_tags(&mut name[..], mode, &mut intermediate, tag_pos).is_ok());
+        intermediate.resize(name.len() - tag_pos, b'z');
+        let newlen = sort_tags(&mut name[..], mode, &mut intermediate, tag_pos).unwrap();
+        assert_eq!(
+            &name[..newlen],
+            &b"gorets2;t2=fuck;tag3=shit"[..],
+            "{}",
+            String::from_utf8_lossy(&name[..newlen]),
+        );
 
         let mut name = BytesMut::from(&b"gorets.bobez;t=y;a=b;;;c=e;u=v;c=d;c=b;aaa=z"[..]);
         let tag_pos = find_tag_pos(&name, mode).unwrap();
@@ -784,7 +794,7 @@ mod tests {
         assert_eq!(&name[tag_pos..], &b";t=y;a=b;;;c=e;u=v;c=d;c=b;aaa=z"[..]);
 
         let mut intermediate = BytesMut::new();
-        intermediate.resize(tag_len - 1, 0u8); // intentionally resize to less bytes than required
+        intermediate.resize(tag_len - 2, 0u8); // intentionally resize to less bytes than required
         assert!(sort_tags(&mut name[..], mode, &mut intermediate, tag_pos).is_err());
 
         intermediate.extend_from_slice(&[0u8]); // resize to good length now
