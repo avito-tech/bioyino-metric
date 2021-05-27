@@ -81,7 +81,6 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
 
             let newlen = tag_pos + 1 + offset;
             name[tag_pos + 1..newlen].copy_from_slice(&intermediate[..offset]);
-
             Ok(newlen)
         }
     }

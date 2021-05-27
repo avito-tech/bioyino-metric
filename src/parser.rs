@@ -264,7 +264,8 @@ where
                         //
                         // since the buffer is created by ourselves, we are responsible for it's size, so
                         // it's WAY better to panic here if buffer size is incorrect
-                        sort_tags(&mut name[..], TagFormat::Graphite, &mut self.sort_buf, pos).unwrap();
+                        let newlen = sort_tags(&mut name[..], TagFormat::Graphite, &mut self.sort_buf, pos).unwrap();
+                        name.truncate(newlen);
                     }
 
                     return Some((MetricName::from_raw_parts(name.freeze(), tag_pos), metric));
