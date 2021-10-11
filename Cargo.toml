@@ -17,7 +17,7 @@ combine="^4.3"
 bytes = { version = "^1.0", features = [ "serde" ] }
 num-traits="^0.2"
 lazysort="^0.2"
-lexical-core="^0.7"
+lexical-core="^0.8"
 
 [build-dependencies]
 capnpc = "^0.14"
