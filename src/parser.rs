@@ -174,7 +174,7 @@ where
     E: ParseErrorHandler,
 {
     pub fn new(input: &'a mut BytesMut, max_unparsed: usize, max_tags_len: usize, handler: E) -> Self {
-        let sort_buf = vec![0; max_unparsed];
+        let sort_buf = vec![0; max_tags_len];
         Self {
             input,
             skip: 0,
@@ -624,6 +624,27 @@ mod tests {
                         continue;
                     }
                     assert_eq!(cmet, met);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_bufsizes_differ() {
+        // The test is based on bug, where max_unparsed < max_tags_len
+        for max_unp in vec![10, 100] {
+            for max_tags in vec![10, 100] {
+                let mut data = BytesMut::from(&b"gorets01234567890123456789012345678901234567890123456789;0=1;2=3;4=5;6=7;8=9;1=2;3=4:1|c|@1"[..]);
+                let mut parser = MetricParser::<f64, TestParseErrorHandler>::new(&mut data, max_unp, max_tags, TestParseErrorHandler);
+
+                if let Some((name, metric)) = parser.next() {
+                    assert_eq!(
+                        &name.name[..],
+                        &b"gorets01234567890123456789012345678901234567890123456789;0=1;1=2;2=3;3=4;4=5;6=7;8=9"[..]
+                    );
+                    assert_eq!(metric, StatsdMetric::<f64>::new(1f64, StatsdType::Counter, Some(1f32)).unwrap());
+
+                    assert_eq!(parser.next(), None);
                 }
             }
         }
