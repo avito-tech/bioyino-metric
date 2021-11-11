@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::hash::{Hash, Hasher};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use num_traits::{AsPrimitive, Float};
@@ -88,7 +87,7 @@ pub(crate) fn sort_tags(name: &mut [u8], mode: TagFormat, intermediate: &mut [u8
 
 /// Represents a metric name as a buffer containing the full metric name including tags.
 /// Also provides methods to work with tags.
-#[derive(Debug, Eq, Clone)]
+#[derive(Debug, Eq, Clone, PartialEq, Hash)]
 pub struct MetricName {
     pub name: Bytes,
     pub(crate) tag_pos: Option<usize>,
@@ -369,19 +368,6 @@ impl MetricName {
         self.put_full(buf, naming.destination, &naming.postfix, &naming.prefix, &naming.tag, &naming.tag_value);
 
         Ok(())
-    }
-}
-
-impl PartialEq for MetricName {
-    fn eq(&self, other: &Self) -> bool {
-        // metric with tag position found and tag position not found should be the same
-        self.name == other.name
-    }
-}
-
-impl Hash for MetricName {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
     }
 }
 

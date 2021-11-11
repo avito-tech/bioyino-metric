@@ -254,7 +254,7 @@ where
                         let value: f64 = (*value).as_();
                         timer_builder.set(idx as u32, value);
                     })
-                .last();
+                    .last();
                 0f64
             }
             MetricValue::Set(ref v) => {
@@ -264,7 +264,7 @@ where
                     .map(|(idx, value)| {
                         sebuilder.set(idx as u32, *value);
                     })
-                .last();
+                    .last();
                 0f64
             }
             MetricValue::CustomHistogram(left, ref buckets) => {
@@ -279,7 +279,7 @@ where
                         single_bucket.set_value(boundary.as_());
                         single_bucket.set_counter(*counter);
                     })
-                .last();
+                    .last();
                 0f64
             }
         }
@@ -297,8 +297,8 @@ where
                         let value: f64 = (*value).as_();
                         timer_values.set(idx as u32, value);
                     })
-                .last();
-                }
+                    .last();
+            }
             MetricValue::Set(ref v) => {
                 let mut set_builder = builder.reborrow().init_set(v.len() as u32);
                 v.iter()
@@ -306,8 +306,8 @@ where
                     .map(|(idx, value)| {
                         set_builder.set(idx as u32, *value);
                     })
-                .last();
-                }
+                    .last();
+            }
             MetricValue::CustomHistogram(left, ref buckets) => {
                 let mut h_builder = builder.reborrow().init_custom_histogram();
                 h_builder.set_left_bucket(*left);
@@ -320,8 +320,8 @@ where
                         single_bucket.set_value(boundary.as_());
                         single_bucket.set_counter(*counter);
                     })
-                .last();
-                }
+                    .last();
+            }
         };
     }
 
@@ -650,14 +650,20 @@ where
 
         builder.set_sampling(self.sampling);
 
-        // meta
-        let mut m_builder = builder.reborrow().init_meta();
+        // meta (may be initialized if fill_capnp_name was called before)
+        let mut m_builder = if builder.has_meta() {
+            builder.reborrow().get_meta().unwrap()
+        } else {
+            builder.reborrow().init_meta()
+        };
+
         m_builder.set_update_counter(self.update_counter);
     }
 
     /// fills the name related parts. `unicode_checked` flag must signal that name part was
     /// already checked to be valid unicode
     pub fn fill_capnp_name<'a>(&self, builder: &mut cmetric::Builder<'a>, name: &MetricName, unicode_checked: bool) {
+        // meta (may be initialized if fill_capnp was called before)
         let m_builder = if builder.has_meta() {
             builder.reborrow().get_meta().unwrap()
         } else {
@@ -984,6 +990,30 @@ mod tests {
         let reader = read_message(&mut cursor, capnp::message::DEFAULT_READER_OPTIONS).unwrap();
         let reader = reader.get_root().unwrap();
         let (_, rmetric) = Metric::<Float>::from_capnp(reader).unwrap();
+        assert_eq!(rmetric, metric);
+    }
+
+    #[test]
+    fn test_capnp_with_name() {
+        let metric = Metric::new(MetricValue::Gauge(2f64), None, 1f32);
+        let mut interm = Vec::with_capacity(128);
+        interm.resize(128, 0u8);
+
+        let tagged_name = MetricName::new("some.name.is_tagged_v2;tag1=value1;t=v".into(), TagFormat::Graphite, &mut interm).unwrap();
+        let mut builder = capnp::message::Builder::new_default();
+        let mut m_builder = builder.init_root::<crate::protocol_v2_capnp::metric::Builder>();
+
+        metric.fill_capnp_name(&mut m_builder, &tagged_name, true);
+        metric.fill_capnp(&mut m_builder);
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &builder).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let reader = read_message(&mut cursor, capnp::message::DEFAULT_READER_OPTIONS).unwrap();
+        let reader = reader.get_root().unwrap();
+        let (name, rmetric) = Metric::<Float>::from_capnp(reader).unwrap();
+        dbg!(&name, &tagged_name);
+        assert_eq!(name, tagged_name);
         assert_eq!(rmetric, metric);
     }
 
