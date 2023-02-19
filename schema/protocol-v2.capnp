@@ -4,7 +4,7 @@
 # to pass preaggregated metric batches between agents and cluster nodes
 #
 # unlike version 1 or protocol, version 2 is not intended to be used as a
-# public interfacee to bioyino
+# public interface to bioyino
 #
 # If such a public API is required, feel free to create the issue or PR at the project repository
 
@@ -24,7 +24,14 @@ struct Message {
     union {
         noop @1 :Void;
         snapshot @2 :List(Metric);
+        packed @3 :Data;
+        compressed @4 :Compressed;
     }
+}
+
+struct Compressed {
+    uncompressedSize @0 :UInt64;
+    data @1 :Data;
 }
 
 struct Metric {

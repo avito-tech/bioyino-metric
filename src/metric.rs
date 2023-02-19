@@ -826,6 +826,14 @@ impl ProtocolVersion {
             ProtocolVersion::V2 => V2ID,
         }
     }
+
+    pub fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            0 => Some(ProtocolVersion::V1),
+            V2ID => Some(ProtocolVersion::V2),
+            _ => None,
+        }
+    }
 }
 
 #[inline]
