@@ -371,6 +371,12 @@ impl MetricName {
     }
 }
 
+impl ToString for MetricName {
+    fn to_string(&self) -> std::string::String {
+        std::str::from_utf8(self.name_with_tags()).unwrap().to_owned()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct NamingOptions {

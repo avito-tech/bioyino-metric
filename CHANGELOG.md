@@ -1,3 +1,6 @@
+# 0.5.2
+* implemented `MetricName::to_string`
+
 # 0.5.1
 * implemented filtering NaNs out of Timer metrics
 
