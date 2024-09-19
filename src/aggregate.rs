@@ -313,7 +313,7 @@ impl<'a, F> AggregateCalculator<'a, F>
 where
     F: Float + Debug + FromF64 + AsPrimitive<f64> + AsPrimitive<usize>,
 {
-    pub fn new(metric: &'a mut Metric<F>, aggregates: &'a [Aggregate<F>]) -> Self {
+    pub fn new(metric: &'a mut Metric<F>, aggregates: &'a [Aggregate<F>]) -> Result<Self, String> {
         let timer_last = if let MetricValue::Timer(ref agg) = metric.value() {
             if let Some(last) = agg.last() {
                 Some(*last)
@@ -331,13 +331,16 @@ where
             None
         };
 
-        metric.sort_timer();
-        Self {
-            metric,
-            timer_sum,
-            timer_last,
-            aggregates,
-            current: 0,
+        if let Err(()) = metric.sort_timer() {
+            Err(format!("failed to sort timer metric"))
+        } else {
+            Ok(Self {
+                metric,
+                timer_sum,
+                timer_last,
+                aggregates,
+                current: 0,
+            })
         }
     }
 }
@@ -405,6 +408,20 @@ mod tests {
 
     use crate::metric::{StatsdMetric, StatsdType};
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn timer_has_incomparable_values() {
+        let metric_value = MetricValue::Timer(vec![f64::NAN, 10f64]);
+        let mut metric = Metric::new(metric_value, None, 2f32);
+        let aggregates = [Aggregate::Count];
+        
+        let calc = AggregateCalculator::new(&mut metric, &aggregates);
+
+        match calc {
+            Ok(_) => panic!("expected error but found ok"),
+            Err(e) => assert_eq!(e, "failed to sort timer metric")
+        }
+    }
 
     #[test]
     fn aggregates_eq_and_hashing_f32() {
@@ -529,7 +546,10 @@ mod tests {
             .into_iter()
             .map(|metric| {
                 let mut calc_metric = metric.clone();
-                let calculator = AggregateCalculator::new(&mut calc_metric, &aggregates);
+                let calculator = match AggregateCalculator::new(&mut calc_metric, &aggregates) {
+                    Ok(c) => c,
+                    Err(e) => panic!("failed to create aggregate calculator: {}", e)
+                };
                 calculator
                     //.inspect(|res| {
                     //dbg!(res);
