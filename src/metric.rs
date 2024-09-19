@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::fmt::Debug;
@@ -506,10 +507,22 @@ where
         self.timestamp
     }
 
-    pub fn sort_timer(&mut self) {
+    pub fn sort_timer(&mut self) -> Result<(), ()> {
+        let mut result = Ok(());
+
         if let MetricValue::Timer(ref mut agg) = self.value {
-            agg.sort_unstable_by(|ref v1, ref v2| v1.partial_cmp(v2).unwrap());
+            agg.sort_unstable_by(|ref v1, ref v2| {
+                match v1.partial_cmp(v2) {
+                    Some(ord) => ord,
+                    None => {
+                        result = Err(());
+                        Ordering::Less
+                    }
+                }
+            });
         }
+
+        result
     }
 
     pub fn accumulate(&mut self, other: Metric<F>) -> Result<(), MetricError> {
