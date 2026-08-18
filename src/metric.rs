@@ -14,6 +14,38 @@ use crate::name::{find_tag_pos, MetricName, TagFormat};
 use crate::protocol_capnp::{gauge as gauge_v1, metric as cmetric_v1, metric_type};
 use crate::protocol_v2_capnp::{metric as cmetric, metric::metric_meta::tags, metric::metric_value, ID as V2ID};
 
+// Full sorting is faster for small timers. At and above this size, selecting only the ranks
+// requested by configured aggregates is faster while producing the same exact percentiles.
+const TIMER_ORDER_STATISTICS_THRESHOLD: usize = 4_096;
+
+fn compare_timer_values<F>(left: &F, right: &F) -> Ordering
+where
+    F: Float,
+{
+    left.partial_cmp(right)
+        .expect("timer values were checked for incomparable values before selection")
+}
+
+fn select_timer_order_statistics<F>(values: &mut [F], ranks: &[usize], offset: usize)
+where
+    F: Float,
+{
+    if ranks.is_empty() {
+        return;
+    }
+
+    // Selecting the middle requested rank first splits the remaining ranks into two independent
+    // subproblems. The selected positions have exactly the same values as in a fully sorted slice;
+    // ordering all other positions is unnecessary for percentile calculation.
+    let middle = ranks.len() / 2;
+    let rank = ranks[middle];
+    let local_rank = rank - offset;
+    let (lower, _, upper) = values.select_nth_unstable_by(local_rank, compare_timer_values);
+
+    select_timer_order_statistics(lower, &ranks[..middle], offset);
+    select_timer_order_statistics(upper, &ranks[middle + 1..], rank + 1);
+}
+
 #[derive(Error, Debug)]
 pub enum MetricError {
     #[error("float conversion")]
@@ -508,21 +540,34 @@ where
     }
 
     pub fn sort_timer(&mut self) -> Result<(), ()> {
-        let mut result = Ok(());
-
         if let MetricValue::Timer(ref mut agg) = self.value {
-            agg.sort_unstable_by(|ref v1, ref v2| {
-                match v1.partial_cmp(v2) {
-                    Some(ord) => ord,
-                    None => {
-                        result = Err(());
-                        Ordering::Less
-                    }
-                }
-            });
+            if agg.iter().any(|value| value.is_nan()) {
+                return Err(());
+            }
+            agg.sort_unstable_by(compare_timer_values);
         }
 
-        result
+        Ok(())
+    }
+
+    /// Places the requested ranks at their fully-sorted positions without sorting unrelated
+    /// values. `ranks` must be sorted, unique and valid for the timer value.
+    pub(crate) fn prepare_timer_order_statistics(&mut self, ranks: &[usize]) -> Result<(), ()> {
+        if let MetricValue::Timer(ref mut values) = self.value {
+            if values.iter().any(|value| value.is_nan()) {
+                return Err(());
+            }
+
+            if values.len() < TIMER_ORDER_STATISTICS_THRESHOLD {
+                values.sort_unstable_by(compare_timer_values);
+            } else if !ranks.is_empty() {
+                debug_assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]));
+                debug_assert!(ranks.last().map_or(true, |rank| *rank < values.len()));
+                select_timer_order_statistics(values, ranks, 0);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn accumulate(&mut self, other: Metric<F>) -> Result<(), MetricError> {
