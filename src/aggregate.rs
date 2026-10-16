@@ -38,6 +38,46 @@ where
     d0 + d1
 }
 
+fn percentile_ranks<F>(len: usize, nth: F) -> (usize, usize)
+where
+    F: Float + AsPrimitive<usize>,
+{
+    let last = F::from(len - 1).unwrap();
+    let position = nth * last;
+    (position.floor().as_(), position.ceil().as_())
+}
+
+fn timer_order_statistic_ranks<F>(len: usize, aggregates: &[Aggregate<F>]) -> Vec<usize>
+where
+    F: Float + Debug + FromF64 + AsPrimitive<usize>,
+{
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let mut ranks = Vec::with_capacity(aggregates.len() * 2);
+    for aggregate in aggregates {
+        match *aggregate {
+            Aggregate::Min => ranks.push(0),
+            Aggregate::Max => ranks.push(len - 1),
+            Aggregate::Median => {
+                let (lower, upper) = percentile_ranks(len, F::from_f64(0.5));
+                ranks.push(lower);
+                ranks.push(upper);
+            }
+            Aggregate::Percentile(percentile, _) => {
+                let (lower, upper) = percentile_ranks(len, percentile);
+                ranks.push(lower);
+                ranks.push(upper);
+            }
+            _ => {}
+        }
+    }
+    ranks.sort_unstable();
+    ranks.dedup();
+    ranks
+}
+
 fn fill_cached_sum<F>(agg: &[F], sum: &mut Option<F>)
 where
     F: Float,
@@ -331,7 +371,12 @@ where
             None
         };
 
-        if let Err(()) = metric.sort_timer() {
+        let timer_order_statistic_ranks = match metric.value() {
+            MetricValue::Timer(values) => timer_order_statistic_ranks(values.len(), aggregates),
+            _ => Vec::new(),
+        };
+
+        if let Err(()) = metric.prepare_timer_order_statistics(&timer_order_statistic_ranks) {
             Err(format!("failed to sort timer metric"))
         } else {
             Ok(Self {
@@ -421,6 +466,268 @@ mod tests {
             Ok(_) => panic!("expected error but found ok"),
             Err(e) => assert_eq!(e, "failed to sort timer metric")
         }
+    }
+
+    fn shuffled_timer_values(len: usize) -> Vec<f64> {
+        (0..len as u64)
+            .map(|value| ((value * 48_271) % len as u64) as f64)
+            .collect()
+    }
+
+    fn random_timer_values(len: usize) -> Vec<f64> {
+        let mut state = 0x4d59_5df4_d0f3_3173u64;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                (state >> 11) as f64
+            })
+            .collect()
+    }
+
+    fn production_timer_aggregates() -> Vec<Aggregate<f64>> {
+        vec![
+            Aggregate::Count,
+            Aggregate::Min,
+            Aggregate::Max,
+            Aggregate::Sum,
+            Aggregate::Median,
+            Aggregate::Mean,
+            Aggregate::Percentile(0.75, 75),
+            Aggregate::Percentile(0.95, 95),
+            Aggregate::Percentile(0.98, 98),
+            Aggregate::Percentile(0.99, 99),
+            Aggregate::Percentile(0.999, 999),
+        ]
+    }
+
+    fn assert_f64_order_statistics_match_full_sort(values: Vec<f64>, aggregates: &[Aggregate<f64>]) {
+        let mut sorted = values.clone();
+        sorted.sort_unstable_by(|left, right| left.partial_cmp(right).unwrap());
+
+        let expected = aggregates
+            .iter()
+            .map(|aggregate| match *aggregate {
+                Aggregate::Min => sorted[0],
+                Aggregate::Max => sorted[sorted.len() - 1],
+                Aggregate::Median => percentile(&sorted, 0.5),
+                Aggregate::Percentile(value, _) => percentile(&sorted, value),
+                _ => panic!("unsupported aggregate in order-statistics test: {:?}", aggregate),
+            })
+            .collect::<Vec<_>>();
+
+        let mut metric = Metric::new(MetricValue::Timer(values), None, 1.0);
+        let actual = AggregateCalculator::new(&mut metric, aggregates)
+            .unwrap()
+            .filter_map(|result| result)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn large_timer_order_statistics_match_full_sort() {
+        let values = shuffled_timer_values(100_003);
+        let mut sorted = values.clone();
+        sorted.sort_unstable_by(|left, right| left.partial_cmp(right).unwrap());
+
+        let aggregates = production_timer_aggregates();
+        let mut metric = Metric::new(MetricValue::Timer(values), None, 1.0);
+        let actual = AggregateCalculator::new(&mut metric, &aggregates)
+            .unwrap()
+            .filter_map(|result| result)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+
+        let len = sorted.len() as f64;
+        let sum = sorted.iter().sum::<f64>();
+        let expected = vec![
+            len,
+            sorted[0],
+            sorted[sorted.len() - 1],
+            sum,
+            percentile(&sorted, 0.5),
+            sum / len,
+            percentile(&sorted, 0.75),
+            percentile(&sorted, 0.95),
+            percentile(&sorted, 0.98),
+            percentile(&sorted, 0.99),
+            percentile(&sorted, 0.999),
+        ];
+
+        assert_eq!(actual, expected);
+        if let MetricValue::Timer(values) = metric.value() {
+            assert!(values.windows(2).any(|pair| pair[0] > pair[1]));
+        }
+    }
+
+    #[test]
+    fn timer_order_statistics_match_around_threshold() {
+        let aggregates = vec![
+            Aggregate::Min,
+            Aggregate::Max,
+            Aggregate::Median,
+            Aggregate::Percentile(0.001, 1),
+            Aggregate::Percentile(0.01, 1),
+            Aggregate::Percentile(0.333, 333),
+            Aggregate::Percentile(0.9, 9),
+            Aggregate::Percentile(0.99, 99),
+            Aggregate::Percentile(0.999, 999),
+        ];
+
+        for len in [4_095, 4_096, 4_097, 8_191, 10_003] {
+            assert_f64_order_statistics_match_full_sort(random_timer_values(len), &aggregates);
+        }
+    }
+
+    #[test]
+    fn large_timer_without_order_statistics_is_not_reordered() {
+        let values = random_timer_values(10_003);
+        let original_last = values[values.len() - 1];
+        let expected_sum = values.iter().sum::<f64>();
+        let aggregates = vec![
+            Aggregate::Count,
+            Aggregate::Last,
+            Aggregate::Sum,
+            Aggregate::Mean,
+            Aggregate::UpdateCount,
+            Aggregate::Rate(Some(30.0)),
+        ];
+
+        let mut metric = Metric::new(MetricValue::Timer(values.clone()), None, 1.0);
+        let actual = AggregateCalculator::new(&mut metric, &aggregates)
+            .unwrap()
+            .filter_map(|result| result)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![
+                values.len() as f64,
+                original_last,
+                expected_sum,
+                expected_sum / values.len() as f64,
+                1.0,
+                1.0 / 30.0,
+            ]
+        );
+        assert_eq!(metric.value(), &MetricValue::Timer(values));
+    }
+
+    #[test]
+    fn large_timer_with_nan_is_rejected() {
+        let mut values = random_timer_values(10_003);
+        values[7_777] = f64::NAN;
+        let mut metric = Metric::new(MetricValue::Timer(values), None, 1.0);
+
+        let result = AggregateCalculator::new(&mut metric, &[Aggregate::Median]);
+
+        match result {
+            Ok(_) => panic!("expected a timer aggregation error"),
+            Err(error) => assert_eq!(error, "failed to sort timer metric"),
+        }
+    }
+
+    #[test]
+    fn large_timer_with_duplicates_and_infinities_matches_full_sort() {
+        let pattern = [f64::NEG_INFINITY, -10.0, -10.0, 0.0, 10.0, 10.0, f64::INFINITY];
+        let values = pattern.iter().copied().cycle().take(10_003).collect::<Vec<_>>();
+        let aggregates = vec![
+            Aggregate::Min,
+            Aggregate::Max,
+            Aggregate::Median,
+            Aggregate::Percentile(0.25, 25),
+            Aggregate::Percentile(0.75, 75),
+        ];
+
+        assert_f64_order_statistics_match_full_sort(values, &aggregates);
+    }
+
+    #[test]
+    fn large_f32_timer_order_statistics_match_full_sort() {
+        let values = shuffled_timer_values(10_003)
+            .into_iter()
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let mut sorted = values.clone();
+        sorted.sort_unstable_by(|left, right| left.partial_cmp(right).unwrap());
+        let aggregates = vec![
+            Aggregate::Min,
+            Aggregate::Max,
+            Aggregate::Median,
+            Aggregate::Percentile(0.75, 75),
+            Aggregate::Percentile(0.999, 999),
+        ];
+        let expected = vec![
+            sorted[0],
+            sorted[sorted.len() - 1],
+            percentile(&sorted, 0.5),
+            percentile(&sorted, 0.75),
+            percentile(&sorted, 0.999),
+        ];
+
+        let mut metric = Metric::new(MetricValue::Timer(values), None, 1.0);
+        let actual = AggregateCalculator::new(&mut metric, &aggregates)
+            .unwrap()
+            .filter_map(|result| result)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_large_timer_order_statistics() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let values_count = std::env::var("BIOYINO_BENCH_TIMER_VALUES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10_000_000);
+        let iterations = std::env::var("BIOYINO_BENCH_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let values = random_timer_values(values_count);
+        let aggregates = production_timer_aggregates();
+        let mut full_sort_duration = Duration::default();
+        let mut selection_duration = Duration::default();
+
+        for _ in 0..iterations {
+            let mut fully_sorted = values.clone();
+            let full_sort_started = Instant::now();
+            assert!(!fully_sorted.iter().any(|value| value.is_nan()));
+            let sum = fully_sorted.iter().sum::<f64>();
+            fully_sorted.sort_unstable_by(|left, right| left.partial_cmp(right).unwrap());
+            full_sort_duration += full_sort_started.elapsed();
+            black_box(sum);
+            black_box(&fully_sorted);
+
+            let mut metric = Metric::new(MetricValue::Timer(values.clone()), None, 1.0);
+            let selection_started = Instant::now();
+            let actual = AggregateCalculator::new(&mut metric, &aggregates)
+                .unwrap()
+                .filter_map(|result| result)
+                .collect::<Vec<_>>();
+            selection_duration += selection_started.elapsed();
+
+            assert_eq!(actual.len(), aggregates.len());
+            black_box(actual);
+        }
+
+        let full_sort_average_ns = full_sort_duration.as_nanos() / iterations as u128;
+        let selection_average_ns = selection_duration.as_nanos() / iterations as u128;
+        eprintln!(
+            "values={}, iterations={}, full_sort_avg_ns={}, order_statistics_avg_ns={}, speedup={:.2}",
+            values_count,
+            iterations,
+            full_sort_average_ns,
+            selection_average_ns,
+            full_sort_duration.as_secs_f64() / selection_duration.as_secs_f64(),
+        );
     }
 
     #[test]
